@@ -7,8 +7,6 @@
 
 Good Frame is a **Mac app** that lets you crop a video or image precisely in a **zoomable canvas**.
 
-## Screenshot
-
 <img src="media/good-frame-screenshot.png" alt="video-crop-screenshot" style="width:100%;" />
 
 ## Install
@@ -22,4 +20,4 @@ Requires macOS 15.6 or later.
 
 ## Features
 
-Visit [**poshtinkering.com/good-frame**](https://www.poshtinkering.com/good-frame).
+Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-frame).
