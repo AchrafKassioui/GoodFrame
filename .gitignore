@@ -1,0 +1,16 @@
+# Local screenshots, recordings, and design files.
+/media/*
+!/media/good-frame-icon-shadow.png
+!/media/good-frame-screenshot.png
+/sample-preview.png
+
+# Xcode user settings and generated builds.
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+Build/
+*.xcarchive/
+*.app/
+*.dmg
+.DS_Store
