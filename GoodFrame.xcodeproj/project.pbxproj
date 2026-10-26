@@ -13,6 +13,7 @@
 		D10000000000000000000003 /* Credits.rtf in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000004 /* Credits.rtf */; };
 		DE0E75CB308AA81F007C9F33 /* GoodFrame.icon in Resources */ = {isa = PBXBuildFile; fileRef = DE0E75CA308AA81F007C9F33 /* GoodFrame.icon */; };
 		DE1E5602308BBC3900696E8D /* Media.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = DE1E5601308BBC3900696E8D /* Media.xcassets */; };
+		DE1E5604308FE54800696E8D /* LICENSE in Resources */ = {isa = PBXBuildFile; fileRef = DE1E5603308FE54800696E8D /* LICENSE */; };
 		DEA368B83086657B00015C4D /* entry.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEA368B73086657A00015C4D /* entry.swift */; };
 /* End PBXBuildFile section */
 
@@ -27,6 +28,7 @@
 		DE0E75C83088314F007C9F33 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		DE0E75CA308AA81F007C9F33 /* GoodFrame.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = GoodFrame.icon; sourceTree = "<group>"; };
 		DE1E5601308BBC3900696E8D /* Media.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Media.xcassets; sourceTree = "<group>"; };
+		DE1E5603308FE54800696E8D /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
 		DEA368B73086657A00015C4D /* entry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = entry.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -44,6 +46,7 @@
 		A00000000000000000000003 = {
 			isa = PBXGroup;
 			children = (
+				DE1E5603308FE54800696E8D /* LICENSE */,
 				DEA368B73086657A00015C4D /* entry.swift */,
 				D10000000000000000000004 /* Credits.rtf */,
 				D10000000000000000000005 /* Version.xcconfig */,
@@ -118,6 +121,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				DE1E5604308FE54800696E8D /* LICENSE in Resources */,
 				DE0E75CB308AA81F007C9F33 /* GoodFrame.icon in Resources */,
 				D10000000000000000000003 /* Credits.rtf in Resources */,
 				C00000000000000000000001 /* Good Frame Sample.mov in Resources */,

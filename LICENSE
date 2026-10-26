@@ -1,0 +1,66 @@
+# Good Frame License
+
+Version 1.0  
+Copyright © 2026 Achraf Kassioui
+
+## 1. Scope
+
+This license applies to Good Frame and its accompanying source code and documentation (“the Software”), except for third-party components covered by their own licenses.
+
+## 2. Free use
+
+You may download, install, run, study, and modify the Software free of charge for personal, educational, or professional purposes.
+
+You may use Good Frame in paid work. This license places no restrictions on the images, videos, or other content you create or process with it.
+
+## 3. Reusing code
+
+You may copy, adapt, and incorporate individual functions, classes, or other portions of the source code into your own projects, including commercial and closed-source projects.
+
+When distributing a project containing copied or adapted code, you must retain the following notice in its source code, documentation, or third-party acknowledgments:
+
+“Contains code from Good Frame, copyright © 2026 Achraf Kassioui. Used under the Good Frame License.”
+
+This permission does not allow you to sell the Software itself or a repackaged version of it. Copying the application as a whole, or dividing its code into portions and recombining them into substantially the same application, does not qualify as individual code reuse.
+
+## 4. Free redistribution
+
+You may distribute the Software and modified versions free of charge, provided that you:
+
+- Include this license and retain the original copyright notices.
+- Clearly identify modified versions as unofficial and describe that they have been modified.
+- Keep the distributed Software under this license.
+
+The code-reuse permission in Section 3 does not require your otherwise independent project to use this license.
+
+## 5. No sale of the application
+
+Without prior written permission from Achraf Kassioui, you may not sell, rent, lease, or charge for downloading or accessing Good Frame or a repackaged version of it.
+
+A repackaged version includes the application redistributed with changes to its name, branding, appearance, packaging, or functionality while retaining the application as its basis.
+
+You may not include such an application in a paid bundle or subscription. These restrictions do not prohibit the commercial code reuse permitted by Section 3 or professional use permitted by Section 2.
+
+## 6. Name and branding
+
+This license does not grant trademark rights or permission to imply endorsement by Achraf Kassioui. Modified versions must not be presented as official Good Frame releases.
+
+## 7. No warranty
+
+To the fullest extent permitted by applicable law, the Software is provided “as is,” without warranties of any kind, express or implied, including warranties of merchantability, fitness for a particular purpose, and non-infringement.
+
+The copyright holders and contributors do not guarantee that the Software will operate correctly or meet your requirements. You are responsible for maintaining backups of your files.
+
+## 8. Limitation of liability
+
+To the fullest extent permitted by applicable law, the copyright holders and contributors shall not be liable for claims, damages, or other liability arising from the Software or its use, including loss or corruption of files, loss of data, lost profits, or business interruption.
+
+Nothing in this license excludes or limits liability that cannot legally be excluded or limited.
+
+## 9. Termination
+
+Your permissions under this license terminate automatically if you violate its terms. Termination does not affect the rights of recipients who obtained copies in compliance with this license and continue to comply with it.
+
+## 10. Other rights
+
+All rights not expressly granted by this license are reserved. Separate written permission from Achraf Kassioui may authorize uses otherwise restricted by this license.
