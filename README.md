@@ -5,7 +5,7 @@
 
 # Good Frame
 
-Good Frame is a **Mac app** that lets you crop a video or image precisely in a **zoomable canvas**.
+Good Frame is a **Mac app** that lets you crop videos and images carefully with **zoom and pan**.
 
 <img src="media/good-frame-screenshot.png" alt="video-crop-screenshot" style="width:100%;" />
 
