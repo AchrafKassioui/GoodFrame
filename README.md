@@ -18,6 +18,10 @@ Requires macOS 15.6 or later.
 3. Build and run on Mac.
 4. To keep the app in Applications, go to **Product → Show Build Folder in Finder**, open **Products → Debug**, and copy **Good Frame.app** into **Applications**.
 
-## Features
+## Demo & Features
 
 Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-frame).
+
+## Change Log
+
+- 1.1: review windows are opened centered on the app window that started the export.

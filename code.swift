@@ -6,7 +6,7 @@
  
  Achraf Kassioui
  Created 20 Oct 2026
- Updated 23 Oct 2026
+ Updated 28 Oct 2026
  
  */
 @preconcurrency import AVFoundation
@@ -203,17 +203,17 @@ struct CropWindowCommands: Commands {
                 .keyboardShortcut("o")
                 .disabled(actions?.canOpen != true)
             Button("Close File") { actions?.close() }
-                .keyboardShortcut("w", modifiers: [.command, .option])
                 .disabled(actions?.canEdit != true)
         }
-        CommandGroup(replacing: .saveItem) {
+        /// Export and save the review, followed by the standard Close commands.
+        CommandGroup(before: .saveItem) {
+            Button("Export Crop…") { actions?.export() }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
+                .disabled(actions?.canExport != true)
             Button("Save…") { CropWindowRegistry.shared.activeReview?.save(nil) }
                 .keyboardShortcut("s")
                 .disabled(CropWindowRegistry.shared.activeReview == nil)
                 .help("Save a finished export from its review window.")
-            Button("Export Crop…") { actions?.export() }
-                .keyboardShortcut("e", modifiers: [.command, .shift])
-                .disabled(actions?.canExport != true)
         }
         CommandGroup(after: .toolbar) {
             Button("Zoom In") { actions?.zoomIn() }
@@ -451,6 +451,15 @@ struct EditorView: View {
         } message: {
             Text(exportError ?? "")
         }
+        /// Ask before closing a window that is exporting.
+        .dismissalConfirmationDialog("Cancel Export and Close?", shouldPresent: busy) {
+            Button("Keep Exporting", role: .cancel) { }
+            Button("Cancel Export and Close", role: .destructive) {
+                exportTask?.cancel()
+            }
+        } message: {
+            Text("The unfinished export will be discarded.")
+        }
         .onAppear { _ = ExportTemporaryStorage.shared }
         .onDisappear { exportTask?.cancel() }
     }
@@ -614,6 +623,8 @@ struct EditorView: View {
     
     /// Export the image in the background, then offer the same Save and Discard workflow as video.
     private func exportImage(_ image: ImageSource, sourceURL: URL) {
+        /// Remember which window started this export.
+        let exportWindow = NSApp.keyWindow
         let selectedCrop = crop.rectangle(in: sourceSize)
         let selectedSettings = history.imageEncoding
         let destination = ExportTemporaryStorage.shared.directory.appendingPathComponent("GoodFrame-\(UUID().uuidString).\(selectedSettings.format.fileExtension)")
@@ -647,7 +658,7 @@ struct EditorView: View {
                     isHDR: false, resolution: selectedCrop.size, imageFormat: selectedSettings.format.rawValue)
                 let document = ExportReviewDocument(
                     exportURL: destination, title: sourceURL.deletingPathExtension().lastPathComponent + "-framed",
-                    summary: summary, contentType: selectedSettings.format.contentType)
+                    summary: summary, contentType: selectedSettings.format.contentType, parentWindow: exportWindow)
                 NSDocumentController.shared.addDocument(document)
                 document.makeWindowControllers()
                 document.showWindows()
@@ -665,6 +676,8 @@ struct EditorView: View {
     
     /// Export the crop, then open the result for review and saving.
     private func exportMedia() {
+        /// Remember which window started this export.
+        let exportWindow = NSApp.keyWindow
         NSApp.keyWindow?.makeFirstResponder(nil)
         guard canExport, let sourceURL else { return }
         if let imageSource {
@@ -705,7 +718,7 @@ struct EditorView: View {
                     codec: selectedSettings.codec.rawValue, bitrate: selectedSettings.megabitsPerSecond,
                     bytes: bytes, elapsed: Date().timeIntervalSince(started), isHDR: sourceIsHDR, resolution: selectedCrop.size)
                 let document = ExportReviewDocument(
-                    exportURL: destinationURL, title: sourceURL.deletingPathExtension().lastPathComponent + "-framed", summary: summary)
+                    exportURL: destinationURL, title: sourceURL.deletingPathExtension().lastPathComponent + "-framed", summary: summary, parentWindow: exportWindow)
                 NSDocumentController.shared.addDocument(document)
                 document.makeWindowControllers()
                 document.showWindows()
@@ -3337,14 +3350,16 @@ struct ExportInformation: View {
 final class ExportReviewDocument: NSDocument {
     
     private let temporaryExportURL: URL
+    private weak var parentWindow: NSWindow?
     private let contentType: UTType
     private var reviewPlayer: AVPlayer?
     private let summary: ExportSummary
     private var loopEnabled = false
     private var endObserver: NSObjectProtocol?
     
-    init(exportURL: URL, title: String, summary: ExportSummary, contentType: UTType = .quickTimeMovie) {
+    init(exportURL: URL, title: String, summary: ExportSummary, contentType: UTType = .quickTimeMovie, parentWindow: NSWindow? = nil) {
         temporaryExportURL = exportURL
+        self.parentWindow = parentWindow
         self.contentType = contentType
         self.summary = summary
         super.init()
@@ -3367,7 +3382,7 @@ final class ExportReviewDocument: NSDocument {
                 styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             window.contentView = NSHostingView(rootView: ImageReviewView(image: image, summary: summary))
             window.title = displayName
-            window.center()
+            positionReview(window)
             addWindowController(NSWindowController(window: window))
             return
         }
@@ -3407,8 +3422,21 @@ final class ExportReviewDocument: NSDocument {
         window.contentView = playerView
         window.title = displayName
         window.subtitle = ""
-        window.center()
+        positionReview(window)
         addWindowController(NSWindowController(window: window))
+    }
+    
+    /// Center the review over the exporting window and keep it on screen.
+    private func positionReview(_ window: NSWindow) {
+        guard let screen = parentWindow?.screen ?? NSScreen.main else { return }
+        let visibleFrame = screen.visibleFrame
+        let parentFrame = parentWindow?.frame ?? visibleFrame
+        var reviewFrame = window.frame
+        reviewFrame.size.width = min(reviewFrame.width, visibleFrame.width)
+        reviewFrame.size.height = min(reviewFrame.height, visibleFrame.height)
+        reviewFrame.origin.x = min(max(parentFrame.midX - reviewFrame.width / 2, visibleFrame.minX), visibleFrame.maxX - reviewFrame.width)
+        reviewFrame.origin.y = min(max(parentFrame.midY - reviewFrame.height / 2, visibleFrame.minY), visibleFrame.maxY - reviewFrame.height)
+        window.setFrame(reviewFrame, display: false)
     }
     
     /// Turn looping on or off in the player menu.
