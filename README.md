@@ -30,6 +30,7 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 - Export the current video frame as PNG or JPEG, with HDR support.
 - Copy images directly from the export window.
 - Drag exported files using the proxy icon (title bar file icon).
+- Open a new app window fron the Dock menu.
 - UI Improvements and new keyboard shortcuts.
 
 ### 1.1

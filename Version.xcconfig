@@ -2,4 +2,4 @@
 MARKETING_VERSION = 1.2
 
 /// Increase this for each distributed build of the same version.
-CURRENT_PROJECT_VERSION = 1
+CURRENT_PROJECT_VERSION = 2
