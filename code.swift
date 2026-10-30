@@ -6,7 +6,7 @@
  
  Achraf Kassioui
  Created 20 Oct 2026
- Updated 28 Oct 2026
+ Updated 29 Oct 2026
  
  */
 @preconcurrency import AVFoundation
@@ -17,6 +17,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import VideoToolbox
 import ImageIO
+import CoreImage
 
 // MARK: Appearance and Settings
 
@@ -99,11 +100,15 @@ enum CropZoomStops {
 /// Use English number formatting, such as 15.4 MB.
 enum CropFormatting {
     static let locale = Locale(identifier: "en_US")
+    static let seconds = FloatingPointFormatStyle<Double>.number
+        .grouping(.never)
+        .precision(.fractionLength(2))
+        .locale(locale)
 }
 
 // MARK: Window Menus
 
-/// Attach explicitly requested tabs and track the active export review.
+/// Attach explicitly requested tabs and track the active export window.
 @MainActor @Observable
 final class CropWindowRegistry {
     static let shared = CropWindowRegistry()
@@ -116,22 +121,22 @@ final class CropWindowRegistry {
     private var tabParents: [UUID: WindowReference] = [:]
     @ObservationIgnored private var closeObserver: NSObjectProtocol?
     @ObservationIgnored private var focusObservers: [NSObjectProtocol] = []
-    /// Save applies to the export review window the user is working in.
-    private(set) var activeReview: ExportReviewDocument?
+    /// Save applies to the export window the user is working in.
+    private(set) var activeExport: ExportDocument?
     
     private init() {
         for notificationName in [NSWindow.didBecomeKeyNotification, NSWindow.didBecomeMainNotification] {
             focusObservers.append(NotificationCenter.default.addObserver(forName: notificationName, object: nil, queue: .main) { [weak self] notification in
                 MainActor.assumeIsolated {
                     guard let window = notification.object as? NSWindow else { return }
-                    self?.activeReview = window.windowController?.document as? ExportReviewDocument
+                    self?.activeExport = window.windowController?.document as? ExportDocument
                 }
             })
         }
         closeObserver = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] notification in
             MainActor.assumeIsolated {
                 guard let self, let window = notification.object as? NSWindow else { return }
-                if self.activeReview === window.windowController?.document { self.activeReview = nil }
+                if self.activeExport === window.windowController?.document { self.activeExport = nil }
             }
         }
     }
@@ -178,6 +183,7 @@ struct CropWindowActions {
 extension FocusedValues {
     @Entry var cropWindowActions: CropWindowActions?
     @Entry var cropHistory: EditHistory?
+    @Entry var cropPlayback: PlaybackState?
 }
 
 /// The app menus and their keyboard shortcuts.
@@ -185,6 +191,7 @@ struct CropWindowCommands: Commands {
     @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.cropWindowActions) private var actions
     @FocusedValue(\.cropHistory) private var history
+    @FocusedValue(\.cropPlayback) private var playback
     
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -205,15 +212,15 @@ struct CropWindowCommands: Commands {
             Button("Close File") { actions?.close() }
                 .disabled(actions?.canEdit != true)
         }
-        /// Export and save the review, followed by the standard Close commands.
+        /// Export and save the result, followed by the standard Close commands.
         CommandGroup(before: .saveItem) {
-            Button("Export Crop…") { actions?.export() }
+            Button(actions?.isImage == true ? "Export Image…" : (history?.exportsFrame == true ? "Export Current Frame…" : "Export Video…")) { actions?.export() }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
                 .disabled(actions?.canExport != true)
-            Button("Save…") { CropWindowRegistry.shared.activeReview?.save(nil) }
+            Button("Save…") { CropWindowRegistry.shared.activeExport?.save(nil) }
                 .keyboardShortcut("s")
-                .disabled(CropWindowRegistry.shared.activeReview == nil)
-                .help("Save a finished export from its review window.")
+                .disabled(CropWindowRegistry.shared.activeExport == nil)
+                .help("Save the exported file")
         }
         CommandGroup(after: .toolbar) {
             Button("Zoom In") { actions?.zoomIn() }
@@ -235,6 +242,21 @@ struct CropWindowCommands: Commands {
                 .keyboardShortcut("i", modifiers: [.command, .option])
                 .disabled(actions?.canEdit != true)
         }
+        CommandMenu("Playback") {
+            Button(playback?.isPlaying == true ? "Pause" : "Play") { playback?.togglePlayback() }
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(playback == nil)
+            Divider()
+            Button("Previous Frame") { playback?.step(by: -1) }
+                .keyboardShortcut("[", modifiers: [])
+                .disabled(playback == nil || playback?.selectedFrame == 0)
+            Button("Next Frame") { playback?.step(by: 1) }
+                .keyboardShortcut("]", modifiers: [])
+                .disabled(playback == nil || (playback?.selectedFrame ?? 0) >= (playback?.frameCount ?? 0) - 1)
+            Divider()
+            Button(playback?.isMuted == true ? "Unmute" : "Mute") { playback?.toggleMute() }
+                .disabled(playback == nil)
+        }
         CommandMenu("Crop") {
             Button(actions?.previewing == true ? "Exit Preview" : "Preview Crop") { actions?.preview() }
                 .keyboardShortcut("p")
@@ -253,7 +275,19 @@ struct CropWindowCommands: Commands {
                             Text("JPEG")
                                 .tag(ImageEncodingSettings.Format.jpeg)
                         }
-                    Divider()
+                } else {
+                    Picker("Format", selection: Binding(
+                        get: { history?.exportFormat ?? .hevc },
+                        set: { history?.exportFormat = $0 })) {
+                            ForEach(ExportFormat.allCases) { format in
+                                Text(format.rawValue)
+                                    .tag(format)
+                                    .disabled(actions?.isHDR == true && format == .h264)
+                            }
+                        }
+                }
+                Divider()
+                if actions?.isImage == true || history?.exportsFrame == true {
                     Button("Increase Quality") { adjustQuality(by: 0.05) }
                         .disabled(history?.imageEncoding.format != .jpeg || (history?.imageEncoding.quality ?? 1) >= 1)
                     Button("Decrease Quality") { adjustQuality(by: -0.05) }
@@ -261,16 +295,6 @@ struct CropWindowCommands: Commands {
                     Button("Reset Quality") { history?.imageEncoding.quality = ImageEncodingSettings().quality }
                         .disabled(history?.imageEncoding.format != .jpeg)
                 } else {
-                    Picker("Codec", selection: Binding(
-                        get: { history?.codec ?? .hevc },
-                        set: { history?.codec = $0 })) {
-                            Text("H.264")
-                                .tag(EncodingSettings.Codec.h264)
-                                .disabled(actions?.isHDR == true)
-                            Text("HEVC")
-                                .tag(EncodingSettings.Codec.hevc)
-                        }
-                    Divider()
                     Button("Increase Bitrate") { adjustBitrate(by: 0.5) }
                         .disabled((history?.bitrate ?? 0) >= (actions?.bitrateRange.upperBound ?? 40))
                     Button("Decrease Bitrate") { adjustBitrate(by: -0.5) }
@@ -303,12 +327,14 @@ struct EditorView: View {
     init(windowIdentity: UUID = UUID()) { self.windowIdentity = windowIdentity }
     @State private var sourceURL: URL?
     @State private var player: AVPlayer?
+    @State private var playback = PlaybackState()
     @State private var imageSource: ImageSource?
     @State private var sourceSize = CGSize.zero
     @State private var sourceMbps = 0.0
     @State private var sourceFPS = 0.0
     @State private var sourceBytes: Int64 = 0
     @State private var sourceIsHDR = false
+    @State private var videoHasTransparency = false
     @State private var previewOnly = false
     @State private var dropTargeted = false
     @State private var showInspector = true
@@ -354,7 +380,7 @@ struct EditorView: View {
                 CropCanvas(
                     player: player, image: imageSource?.image, sourceSize: sourceSize, crop: cropBinding, zoom: $zoom, fit: $fit,
                     previewOnly: previewOnly, cameraRequest: cameraRequest, centerCameraOnRequest: centerCameraOnRequest, framingInsets: player == nil ? NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20) : layout.framingInsets,
-                    history: history, windowIdentity: windowIdentity, canvasColor: loaded ? NSColor(canvasColor) : .windowBackgroundColor, onFit: requestFit,
+                    history: history, playback: !busy && !isImage ? playback : nil, windowIdentity: windowIdentity, canvasColor: loaded ? NSColor(canvasColor) : .windowBackgroundColor, onFit: requestFit,
                     onExitPreview: { previewOnly = false }
                 )
                 .frame(width: geometry.size.width, height: geometry.size.height)
@@ -365,7 +391,8 @@ struct EditorView: View {
                         .frame(width: geometry.size.width, height: geometry.size.height)
                 }
                 if player != nil {
-                    PlaybackControls(player: player, duration: duration)
+                    PlaybackControls(playback: playback)
+                        .disabled(busy)
                         .cropPanel()
                         .frame(width: layout.playbackWidth)
                         .onGeometryChange(for: CGFloat.self) {
@@ -380,7 +407,7 @@ struct EditorView: View {
         .inspector(isPresented: Binding(get: { loaded && showInspector }, set: { showInspector = $0 })) {
             InspectorView(
                 history: history, imageSource: imageSource, sourceSize: sourceSize, sourceMbps: sourceMbps,
-                sourceFPS: sourceFPS, sourceBytes: sourceBytes, sourceIsHDR: sourceIsHDR, duration: duration,
+                sourceFPS: sourceFPS, sourceBytes: sourceBytes, sourceIsHDR: sourceIsHDR, duration: duration, videoHasTransparency: videoHasTransparency,
                 loaded: loaded, busy: busy, canvasColor: $canvasColor,
                 exportState: exportState, canExport: canExport, export: exportMedia,
                 cancel: { exportTask?.cancel() }
@@ -397,41 +424,17 @@ struct EditorView: View {
         .environment(\.locale, CropFormatting.locale)
         /// Get the product name from project settings and display in title bar
         .navigationTitle(sourceURL?.lastPathComponent ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? ""))
-        .toolbar {
-            ToolbarItemGroup(placement: .navigation) {
-                Button("Open…", systemImage: "folder", action: openMedia)
-                    .disabled(busy)
-                    .help("Open an image or video (⌘O)")
-                Button("Undo", systemImage: "arrow.uturn.backward", action: undoEdit)
-                    .disabled(!history.canUndo || busy)
-                    .help("Undo (⌘Z)")
-                Button("Redo", systemImage: "arrow.uturn.forward", action: redoEdit)
-                    .disabled(!history.canRedo || busy)
-                    .help("Redo (⇧⌘Z)")
-            }
-            if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
-            ToolbarItem(id: "preview") {
-                Button(previewOnly ? "Exit Preview" : "Preview Crop", systemImage: previewOnly ? "eye.slash" : "eye") { previewOnly.toggle() }
-                    .disabled(!loaded || busy)
-                    .help("Preview the crop (⌘P)")
-            }
-            if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
-            ToolbarItem(id: "zoom") {
-                ControlGroup("Zoom") {
-                    ZoomControls(
-                        zoom: $zoom, fit: $fit, enabled: loaded && !busy,
-                        step: requestZoomStep, actualSize: requestActualSize,
-                        fitVideo: requestFit)
-                }
-            }
-            if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button("Inspector", systemImage: "sidebar.right", action: toggleInspector)
-                    .disabled(!loaded || busy)
-                    .help("Show or hide the inspector (⌥⌘I)")
-            }
+        .background {
+            EditorToolbar(
+                zoom: $zoom, fit: $fit, loaded: loaded, busy: busy,
+                canUndo: history.canUndo, canRedo: history.canRedo, previewOnly: previewOnly,
+                open: openMedia, undo: undoEdit, redo: redoEdit,
+                preview: { previewOnly.toggle() }, inspector: toggleInspector,
+                step: requestZoomStep, actualSize: requestActualSize, fitVideo: requestFit)
+            .frame(width: 0, height: 0)
         }
         .focusedSceneValue(\.cropHistory, history)
+        .focusedSceneValue(\.cropPlayback, loaded && !isImage && !busy ? playback : nil)
         .focusedSceneValue(\.cropWindowActions, windowActions)
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropTargeted, perform: receiveMedia)
         /// Open files sent by Finder, including drops onto the app icon.
@@ -441,6 +444,9 @@ struct EditorView: View {
         /// SwiftUI reuses an empty editor or opens a new one according to the Mac's tab preference.
         .handlesExternalEvents(preferring: incomingFileEvents, allowing: incomingFileEvents)
         .onExitCommand { previewOnly = false }
+        .onChange(of: history.exportsFrame) {
+            if history.exportsFrame { playback.pause() }
+        }
         .alert("Could Not Open File", isPresented: Binding(get: { openError != nil }, set: { if !$0 { openError = nil } })) {
             Button("OK", role: .cancel) { openError = nil }
         } message: {
@@ -470,7 +476,11 @@ struct EditorView: View {
     private func undoEdit() { CropUndoRouting.perform(history, redo: false) }
     private func redoEdit() { CropUndoRouting.perform(history, redo: true) }
     
-    private var canExport: Bool { loaded && validCrop && (isImage || (settings.isValid && (!sourceIsHDR || settings.codec == .hevc))) && !busy }
+    private var canExport: Bool {
+        loaded && validCrop && !busy && (isImage || (history.exportsFrame
+                                                     ? playback.frameCount > 0
+                                                     : settings.isValid && (!sourceIsHDR || settings.codec == .hevc)))
+    }
     private var originalBitrate: Double { sourceMbps.isFinite && sourceMbps > 0 ? sourceMbps : 2.5 }
     private func requestFit() {
         fit = true
@@ -500,7 +510,7 @@ struct EditorView: View {
             preview: { previewOnly.toggle() }, inspector: toggleInspector,
             resetCrop: { cropBinding.wrappedValue = .fullImage(sourceSize, multiple: history.pixelStep) },
             matchBitrate: { history.bitrate = originalBitrate },
-            canOpen: !busy, canExport: canExport, canEdit: loaded && !busy, canMatchBitrate: loaded && !isImage && !busy,
+            canOpen: !busy, canExport: canExport, canEdit: loaded && !busy, canMatchBitrate: loaded && !isImage && !history.exportsFrame && !busy,
             isImage: isImage, isHDR: sourceIsHDR, bitrateRange: EncodingSettings.bitrateRange(for: sourceMbps),
             previewing: previewOnly, inspecting: showInspector)
     }
@@ -543,6 +553,7 @@ struct EditorView: View {
         NSApp.keyWindow?.makeFirstResponder(nil)
         player?.pause()
         player?.replaceCurrentItem(with: nil)
+        playback.disconnect()
         player = nil
         imageSource = nil
         sourceURL = nil
@@ -551,6 +562,7 @@ struct EditorView: View {
         sourceFPS = 0
         sourceBytes = 0
         sourceIsHDR = false
+        videoHasTransparency = false
         duration = 0
         previewOnly = false
         zoom = 1
@@ -571,6 +583,7 @@ struct EditorView: View {
                     let source = try await Task.detached(priority: .userInitiated) { try ImageSource.load(selectedURL) }.value
                     player?.pause()
                     player?.replaceCurrentItem(with: nil)
+                    playback.disconnect()
                     player = nil
                     imageSource = source
                     sourceURL = selectedURL
@@ -596,9 +609,13 @@ struct EditorView: View {
                 let dataRate = try await geometry.track.load(.estimatedDataRate)
                 let fileSize = try selectedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
                 let color = try await VideoExporter.colorInfo(for: geometry.track)
+                let frames = try await Task.detached(priority: .userInitiated) {
+                    try VideoFrameIndex.load(asset: asset, track: geometry.track, duration: duration)
+                }.value
                 imageSource = nil
                 history.pixelStep = 2
                 sourceIsHDR = color.isHDR
+                videoHasTransparency = try await geometry.track.load(.mediaCharacteristics).contains(.containsAlphaChannel)
                 sourceBytes = Int64(fileSize)
                 sourceSize = geometry.bounds.size
                 sourceMbps = Double(dataRate) / 1_000_000
@@ -606,7 +623,9 @@ struct EditorView: View {
                 sourceURL = selectedURL
                 showInspector = true
                 player?.pause()
-                player = AVPlayer(url: selectedURL)
+                let openedPlayer = AVPlayer(url: selectedURL)
+                player = openedPlayer
+                playback.connect(to: openedPlayer, frames: frames, duration: duration)
                 let originalRate = originalBitrate
                 history.reset(
                     CropEdit(
@@ -621,12 +640,15 @@ struct EditorView: View {
         }
     }
     
-    /// Export the image in the background, then offer the same Save and Discard workflow as video.
-    private func exportImage(_ image: ImageSource, sourceURL: URL) {
+    /// Export an opened image or the selected video frame, then open the export window.
+    private func exportImage(sourceURL: URL) {
         /// Remember which window started this export.
         let exportWindow = NSApp.keyWindow
         let selectedCrop = crop.rectangle(in: sourceSize)
         let selectedSettings = history.imageEncoding
+        let openedImage = imageSource
+        let frameTime = openedImage == nil ? playback.pauseForExport() : nil
+        let frameNumber = openedImage == nil ? playback.selectedFrame + 1 : nil
         let destination = ExportTemporaryStorage.shared.directory.appendingPathComponent("GoodFrame-\(UUID().uuidString).\(selectedSettings.format.fileExtension)")
         busy = true
         exportState.bytes = 0
@@ -642,11 +664,22 @@ struct EditorView: View {
                 exportState.indeterminate = false
                 exportTask = nil
             }
+            let started = Date()
             let worker = Task.detached(priority: .userInitiated) {
+                let image: ImageSource
+                if let openedImage {
+                    image = openedImage
+                } else if let frameTime {
+                    image = try await VideoFrameExporter.image(from: sourceURL, at: frameTime)
+                } else {
+                    throw ImageError.unreadableFrame
+                }
+                try Task.checkCancellation()
                 try ImageExporter.export(source: image, destination: destination, crop: selectedCrop, settings: selectedSettings)
+                return image.isHDR
             }
             do {
-                try await withTaskCancellationHandler {
+                let isHDR = try await withTaskCancellationHandler {
                     try await worker.value
                 } onCancel: {
                     worker.cancel()
@@ -654,10 +687,11 @@ struct EditorView: View {
                 try Task.checkCancellation()
                 let bytes = try destination.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
                 let summary = ExportSummary(
-                    codec: selectedSettings.format.rawValue, bitrate: 0, bytes: Int64(bytes), elapsed: 0,
-                    isHDR: false, resolution: selectedCrop.size, imageFormat: selectedSettings.format.rawValue)
-                let document = ExportReviewDocument(
-                    exportURL: destination, title: sourceURL.deletingPathExtension().lastPathComponent + "-framed",
+                    codec: selectedSettings.format.rawValue, bitrate: 0, bytes: Int64(bytes), elapsed: Date().timeIntervalSince(started),
+                    isHDR: isHDR, resolution: selectedCrop.size, imageFormat: selectedSettings.format.rawValue)
+                let suffix = frameNumber.map { "-frame-\($0)" } ?? "-framed"
+                let document = try ExportDocument(
+                    exportURL: destination, title: sourceURL.deletingPathExtension().lastPathComponent + suffix,
                     summary: summary, contentType: selectedSettings.format.contentType, parentWindow: exportWindow)
                 NSDocumentController.shared.addDocument(document)
                 document.makeWindowControllers()
@@ -674,14 +708,14 @@ struct EditorView: View {
         }
     }
     
-    /// Export the crop, then open the result for review and saving.
+    /// Export the crop, then open the export window.
     private func exportMedia() {
         /// Remember which window started this export.
         let exportWindow = NSApp.keyWindow
         NSApp.keyWindow?.makeFirstResponder(nil)
         guard canExport, let sourceURL else { return }
-        if let imageSource {
-            exportImage(imageSource, sourceURL: sourceURL)
+        if imageSource != nil || history.exportsFrame {
+            exportImage(sourceURL: sourceURL)
             return
         }
         let selectedCrop = crop.rectangle(in: sourceSize)
@@ -717,7 +751,7 @@ struct EditorView: View {
                 let summary = ExportSummary(
                     codec: selectedSettings.codec.rawValue, bitrate: selectedSettings.megabitsPerSecond,
                     bytes: bytes, elapsed: Date().timeIntervalSince(started), isHDR: sourceIsHDR, resolution: selectedCrop.size)
-                let document = ExportReviewDocument(
+                let document = try ExportDocument(
                     exportURL: destinationURL, title: sourceURL.deletingPathExtension().lastPathComponent + "-framed", summary: summary, parentWindow: exportWindow)
                 NSDocumentController.shared.addDocument(document)
                 document.makeWindowControllers()
@@ -798,57 +832,211 @@ struct ZoomControls: View {
     let fitVideo: () -> Void
     
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 6) {
             /// Make the whole button clickable, including the space around the icon.
-            HStack(spacing: 6) {
-                Button {
-                    step(false)
-                } label: {
-                    Image(systemName: "minus")
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.bordered)
-                .disabled(zoom <= CropZoomStops.minimum)
-                .accessibilityLabel("Zoom out")
-                .help("Zoom out")
-                
-                Slider(
-                    value: Binding(
-                        get: { zoom },
-                        set: {
-                            zoom = $0
-                            fit = false
-                        }), in: CropZoomStops.range
-                )
-                .frame(width: 160)
-                .accessibilityLabel("Canvas zoom")
-                .help("Adjust canvas zoom")
-                
-                Button {
-                    step(true)
-                } label: {
-                    Image(systemName: "plus")
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.bordered)
-                .disabled(zoom >= CropZoomStops.maximum)
-                .accessibilityLabel("Zoom in")
-                .help("Zoom in")
+            Button("Zoom Out", systemImage: "minus") {
+                step(false)
             }
+            .labelStyle(.iconOnly)
+            .frame(width: 28, height: 28)
+            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            /// Repeat zoom steps while the mouse button is held.
+            .buttonRepeatBehavior(.enabled)
+            .disabled(zoom <= CropZoomStops.minimum)
+            .help("Zoom out (⌘−)")
             
-            Button("\(Int((zoom * 100).rounded()))%", action: actualSize)
-                .monospacedDigit()
-                .buttonStyle(.plain)
-                .frame(width: 64)
-                .help("Actual size (⌘1)")
+            Slider(
+                value: Binding(
+                    get: { zoom },
+                    set: {
+                        zoom = $0
+                        fit = false
+                    }), in: CropZoomStops.range
+            )
+            .frame(width: 160)
+            .accessibilityLabel("Canvas zoom")
+            .help("Adjust canvas zoom")
+            
+            Button("Zoom In", systemImage: "plus") {
+                step(true)
+            }
+            .labelStyle(.iconOnly)
+            .frame(width: 28, height: 28)
+            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .buttonRepeatBehavior(.enabled)
+            .disabled(zoom >= CropZoomStops.maximum)
+            .help("Zoom in (⌘+)")
+            
+            /// Show the zoom percentage with no digit grouping.
+            Button(action: actualSize) {
+                Text(verbatim: "\(Int((zoom * 100).rounded()))%")
+            }
+            .monospacedDigit()
+            .buttonStyle(.plain)
+            .frame(width: 48)
+            .help("Actual size (⌘1)")
             Button("Fit", action: fitVideo)
-                .frame(minWidth: 48)
+                .buttonStyle(.plain)
+                .frame(width: 40, height: 28)
                 .help("Fit to window (⌘0)")
         }
+        .padding(.horizontal, 6)
+        .fixedSize()
         .disabled(!enabled)
     }
+}
+
+/// Connect the editor's actions to its native window toolbar.
+struct EditorToolbar: NSViewRepresentable {
+    @Binding var zoom: Double
+    @Binding var fit: Bool
+    let loaded: Bool
+    let busy: Bool
+    let canUndo: Bool
+    let canRedo: Bool
+    let previewOnly: Bool
+    let open: () -> Void
+    let undo: () -> Void
+    let redo: () -> Void
+    let preview: () -> Void
+    let inspector: () -> Void
+    let step: (Bool) -> Void
+    let actualSize: () -> Void
+    let fitVideo: () -> Void
+    
+    func makeNSView(context: Context) -> EditorToolbarView {
+        EditorToolbarView(actions: self)
+    }
+    
+    func updateNSView(_ view: EditorToolbarView, context: Context) {
+        view.update(self)
+    }
+}
+
+/// Own the toolbar for this editor window.
+final class EditorToolbarView: NSView, NSToolbarDelegate, NSMenuItemValidation {
+    private var actions: EditorToolbar
+    private let editorToolbar = NSToolbar(identifier: "GoodFrame.EditorToolbar")
+    private var items: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
+    private let zoomView: NSHostingView<ZoomControls>
+    private let zoomMenu = NSMenu(title: "Zoom")
+    
+    private static let openID = NSToolbarItem.Identifier("open")
+    private static let undoID = NSToolbarItem.Identifier("undo")
+    private static let redoID = NSToolbarItem.Identifier("redo")
+    private static let previewID = NSToolbarItem.Identifier("preview")
+    private static let zoomID = NSToolbarItem.Identifier("zoom")
+    private static let inspectorID = NSToolbarItem.Identifier("inspector")
+    
+    init(actions: EditorToolbar) {
+        self.actions = actions
+        zoomView = NSHostingView(rootView: ZoomControls(
+            zoom: actions.$zoom, fit: actions.$fit, enabled: actions.loaded && !actions.busy,
+            step: actions.step, actualSize: actions.actualSize, fitVideo: actions.fitVideo))
+        super.init(frame: .zero)
+        editorToolbar.delegate = self
+        editorToolbar.displayMode = .iconOnly
+        zoomView.sizingOptions = [.intrinsicContentSize]
+        
+        addButton(Self.openID, title: "Open…", symbol: "folder", help: "Open an image or video (⌘O)", action: #selector(openMedia))
+        addButton(Self.undoID, title: "Undo", symbol: "arrow.uturn.backward", help: "Undo (⌘Z)", action: #selector(undoEdit))
+        addButton(Self.redoID, title: "Redo", symbol: "arrow.uturn.forward", help: "Redo (⇧⌘Z)", action: #selector(redoEdit))
+        addButton(Self.previewID, title: "Preview Crop", symbol: "eye", help: "Preview the crop (⌘P)", action: #selector(togglePreview))
+        addButton(Self.inspectorID, title: "Inspector", symbol: "sidebar.right", help: "Show or hide the inspector (⌥⌘I)", action: #selector(toggleInspector))
+        
+        /// One glass background for the complete zoom control.
+        let zoomItem = NSToolbarItemGroup(itemIdentifier: Self.zoomID)
+        zoomItem.label = "Zoom"
+        zoomItem.paletteLabel = "Zoom"
+        zoomItem.autovalidates = false
+        zoomItem.view = zoomView
+        
+        /// The overflow menu contains actions, not the slider.
+        for (title, selector) in [
+            ("Zoom Out", #selector(zoomOut)), ("Zoom In", #selector(zoomIn)),
+            ("Actual Size", #selector(actualSize)), ("Fit", #selector(fitVideo))
+        ] {
+            let menuItem = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+            menuItem.target = self
+            zoomMenu.addItem(menuItem)
+        }
+        let menuItem = NSMenuItem(title: "Zoom", action: nil, keyEquivalent: "")
+        menuItem.submenu = zoomMenu
+        zoomItem.menuFormRepresentation = menuItem
+        items[Self.zoomID] = zoomItem
+        update(actions)
+    }
+    
+    required init?(coder: NSCoder) { fatalError("Use init(actions:)") }
+    
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else { return }
+        window.toolbar = editorToolbar
+    }
+    
+    private func addButton(_ identifier: NSToolbarItem.Identifier, title: String, symbol: String, help: String, action: Selector) {
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.label = title
+        item.paletteLabel = title
+        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        item.toolTip = help
+        item.target = self
+        item.action = action
+        item.autovalidates = false
+        if #available(macOS 26.0, *) {
+            item.isNavigational = [Self.openID, Self.undoID, Self.redoID].contains(identifier)
+        }
+        items[identifier] = item
+    }
+    
+    func update(_ actions: EditorToolbar) {
+        self.actions = actions
+        let enabled = actions.loaded && !actions.busy
+        items[Self.openID]?.isEnabled = !actions.busy
+        items[Self.undoID]?.isEnabled = actions.canUndo && !actions.busy
+        items[Self.redoID]?.isEnabled = actions.canRedo && !actions.busy
+        items[Self.previewID]?.isEnabled = enabled
+        items[Self.zoomID]?.isEnabled = enabled
+        items[Self.inspectorID]?.isEnabled = enabled
+        items[Self.previewID]?.label = actions.previewOnly ? "Exit Preview" : "Preview Crop"
+        items[Self.previewID]?.image = NSImage(systemSymbolName: actions.previewOnly ? "eye.slash" : "eye", accessibilityDescription: nil)
+        zoomView.rootView = ZoomControls(
+            zoom: actions.$zoom, fit: actions.$fit, enabled: enabled,
+            step: actions.step, actualSize: actions.actualSize, fitVideo: actions.fitVideo)
+    }
+    
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [Self.openID, Self.undoID, Self.redoID, .flexibleSpace, Self.previewID, .space, Self.zoomID, .space, Self.inspectorID]
+    }
+    
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        toolbarDefaultItemIdentifiers(toolbar)
+    }
+    
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        items[identifier]
+    }
+    
+    /// Keep overflow commands in sync with the zoom limits.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        guard actions.loaded && !actions.busy else { return false }
+        if menuItem.action == #selector(zoomOut) { return actions.zoom > CropZoomStops.minimum }
+        if menuItem.action == #selector(zoomIn) { return actions.zoom < CropZoomStops.maximum }
+        return true
+    }
+    
+    @objc private func openMedia() { actions.open() }
+    @objc private func undoEdit() { actions.undo() }
+    @objc private func redoEdit() { actions.redo() }
+    @objc private func togglePreview() { actions.preview() }
+    @objc private func toggleInspector() { actions.inspector() }
+    @objc private func zoomOut() { actions.step(false) }
+    @objc private func zoomIn() { actions.step(true) }
+    @objc private func actualSize() { actions.actualSize() }
+    @objc private func fitVideo() { actions.fitVideo() }
 }
 
 /// Export progress, file size, and status message.
@@ -873,6 +1061,7 @@ struct InspectorView: View {
     let sourceBytes: Int64
     let sourceIsHDR: Bool
     let duration: Double
+    let videoHasTransparency: Bool
     let loaded: Bool
     let busy: Bool
     @Binding var canvasColor: Color
@@ -957,7 +1146,7 @@ struct InspectorView: View {
                     } else {
                         CropEncodingSection(
                             history: history, originalBitrate: originalBitrate, sourceMbps: sourceMbps,
-                            loaded: loaded, busy: busy, isHDR: sourceIsHDR)
+                            loaded: loaded, busy: busy, isHDR: sourceIsHDR, hasTransparency: videoHasTransparency)
                     }
                     CropCanvasSection(color: $canvasColor)
                 }
@@ -968,7 +1157,9 @@ struct InspectorView: View {
                 .opacity(0.45)
             CropExportFooter(
                 state: exportState, canExport: canExport, loaded: loaded,
-                outputWidth: outputWidth, outputHeight: outputHeight, encodingName: imageSource == nil ? history.codec.rawValue : history.imageEncoding.format.rawValue,
+                outputWidth: outputWidth, outputHeight: outputHeight,
+                encodingName: imageSource == nil ? history.exportFormat.rawValue : history.imageEncoding.format.rawValue,
+                exportTitle: imageSource != nil ? "Export Image" : (history.exportsFrame ? "Export Current Frame" : "Export Video"),
                 export: export, cancel: cancel)
         }
     }
@@ -1100,7 +1291,7 @@ struct CropInspectorSection<Content: View>: View {
     }
 }
 
-/// Codec and bitrate controls.
+/// Choose a video export or a single-frame image export.
 struct CropEncodingSection: View {
     @Bindable var history: EditHistory
     let originalBitrate: Double
@@ -1108,46 +1299,51 @@ struct CropEncodingSection: View {
     let loaded: Bool
     let busy: Bool
     let isHDR: Bool
+    let hasTransparency: Bool
     
     var body: some View {
         CropInspectorSection("Encoding") {
             HStack {
-                Text("Codec")
+                Text("Format")
                 Spacer()
-                CropCodecPicker(selection: $history.codec, isHDR: isHDR)
+                CropFormatPicker(selection: $history.exportFormat, isHDR: isHDR)
                     .fixedSize()
             }
-            HStack {
-                Text("Bitrate")
-                Spacer()
-                Text(loaded ? "\(history.bitrate.formatted(.number.precision(.fractionLength(2)).locale(CropFormatting.locale))) Mbps" : "—")
-                    .monospacedDigit()
-                CropResetButton("Match Original Bitrate") { history.bitrate = originalBitrate }
+            if history.exportsFrame {
+                ImageQualityControls(history: history, hasTransparency: hasTransparency)
+            } else {
+                HStack {
+                    Text("Bitrate")
+                    Spacer()
+                    Text(loaded ? "\(history.bitrate.formatted(.number.precision(.fractionLength(2)).locale(CropFormatting.locale))) Mbps" : "—")
+                        .monospacedDigit()
+                    CropResetButton("Match Original Bitrate") { history.bitrate = originalBitrate }
+                }
+                Slider(
+                    value: $history.bitrate, in: EncodingSettings.bitrateRange(for: sourceMbps), step: 0.5,
+                    onEditingChanged: { if $0 { history.begin() } else { history.end() } }
+                )
+                .accessibilityLabel("Video bitrate in Mbps")
+                .help("Higher bitrate preserves more detail and produces larger files.")
             }
-            Slider(
-                value: $history.bitrate, in: EncodingSettings.bitrateRange(for: sourceMbps), step: 0.5,
-                onEditingChanged: { if $0 { history.begin() } else { history.end() } }
-            )
-            .accessibilityLabel("Video bitrate in Mbps")
-            .help("Higher bitrate preserves more detail and produces larger files.")
         }
         .disabled(!loaded || busy)
     }
 }
 
-/// Choose H.264 or HEVC. H.264 is disabled for HDR videos.
-struct CropCodecPicker: NSViewRepresentable {
-    @Binding var selection: EncodingSettings.Codec
+/// H.264 is disabled for HDR. PNG and JPEG export the current frame.
+struct CropFormatPicker: NSViewRepresentable {
+    @Binding var selection: ExportFormat
     let isHDR: Bool
     
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     
     func makeNSView(context: Context) -> NSSegmentedControl {
         let control = NSSegmentedControl(
-            labels: EncodingSettings.Codec.allCases.map(\.rawValue), trackingMode: .selectOne,
-            target: context.coordinator, action: #selector(Coordinator.selectCodec(_:)))
+            labels: ExportFormat.allCases.map(\.rawValue), trackingMode: .selectOne,
+            target: context.coordinator, action: #selector(Coordinator.selectFormat(_:)))
         control.controlSize = .small
-        control.setAccessibilityLabel(String(localized: "Codec"))
+        control.setAccessibilityLabel(String(localized: "Export format"))
         return control
     }
     
@@ -1155,26 +1351,24 @@ struct CropCodecPicker: NSViewRepresentable {
         context.coordinator.parent = self
         control.isEnabled = context.environment.isEnabled
         control.setEnabled(!isHDR, forSegment: 0)
-        control.setEnabled(true, forSegment: 1)
-        control.selectedSegment = selection == .h264 ? 0 : 1
-        control.toolTip = String(localized: "HEVC supports HDR. H.264 is available for SDR videos only.")
+        control.selectedSegment = ExportFormat.allCases.firstIndex(of: selection) ?? 1
+        control.setToolTip(String(localized: "H.264 supports SDR video"), forSegment: 0)
+        control.setToolTip(String(localized: "HEVC supports SDR and HDR video"), forSegment: 1)
+        control.setToolTip(String(localized: "Export the current frame as PNG"), forSegment: 2)
+        control.setToolTip(String(localized: "Export the current frame as JPEG"), forSegment: 3)
     }
     
     final class Coordinator: NSObject {
+        var parent: CropFormatPicker
         
-        var parent: CropCodecPicker
+        init(_ parent: CropFormatPicker) { self.parent = parent }
         
-        init(_ parent: CropCodecPicker) {
-            self.parent = parent
-        }
-        
-        @objc func selectCodec(_ sender: NSSegmentedControl) {
-            guard sender.selectedSegment >= 0 else { return }
-            let selected = EncodingSettings.Codec.allCases[sender.selectedSegment]
-            guard !parent.isHDR || selected == .hevc else { return }
+        @objc func selectFormat(_ sender: NSSegmentedControl) {
+            guard ExportFormat.allCases.indices.contains(sender.selectedSegment) else { return }
+            let selected = ExportFormat.allCases[sender.selectedSegment]
+            guard !parent.isHDR || selected != .h264 else { return }
             parent.selection = selected
         }
-        
     }
 }
 
@@ -1224,6 +1418,7 @@ struct CropExportFooter: View {
     let outputWidth: Int
     let outputHeight: Int
     let encodingName: String
+    let exportTitle: LocalizedStringKey
     let export: () -> Void
     let cancel: () -> Void
     @State private var showHelp = false
@@ -1232,7 +1427,7 @@ struct CropExportFooter: View {
         VStack(spacing: 8) {
             ZStack {
                 Button(action: export) {
-                    Text("Export")
+                    Text(exportTitle)
                         .fontWeight(.semibold)
                         .frame(maxWidth: .infinity)
                         .foregroundStyle(canExport ? Color.white : Color.secondary)
@@ -1241,7 +1436,7 @@ struct CropExportFooter: View {
                 .controlSize(.large)
                 .tint(canExport ? CropAppearance.exportAccent : Color(nsColor: .controlColor))
                 .disabled(!canExport)
-                .help("Encode and review the crop (⇧⌘E)")
+                .help("Export the crop (⇧⌘E)")
                 .opacity(state.progress == nil ? 1 : 0)
                 .allowsHitTesting(state.progress == nil)
                 .accessibilityHidden(state.progress != nil)
@@ -1293,7 +1488,7 @@ struct CropExportFooter: View {
                     .popover(isPresented: $showHelp) {
                         Text(
                             """
-                            Pan: middle or right mouse buttons.
+                            Pan: hold H and drag, or use the middle or right mouse button.
                             Zoom: CMD-Scroll.
                             Fit: double-click.
                             Keep crop ratio: Shift-drag a corner.
@@ -1340,11 +1535,23 @@ extension View {
 
 // MARK: Undo and Numeric Fields
 
+/// Video formats export the whole clip. Image formats export the selected frame.
+enum ExportFormat: String, CaseIterable, Identifiable {
+    case h264 = "H.264"
+    case hevc = "HEVC"
+    case png = "PNG"
+    case jpeg = "JPEG"
+    
+    var id: String { rawValue }
+    var isImage: Bool { self == .png || self == .jpeg }
+}
+
 /// The crop and encoding settings saved for each undo step.
 struct CropEdit: Equatable {
     var crop = CropMargins()
     var encoding = EncodingSettings()
     var imageEncoding = ImageEncodingSettings()
+    var exportsFrame = false
 }
 
 /// Stores crop and encoding changes so they can be undone.
@@ -1357,9 +1564,28 @@ final class EditHistory {
     private var currentCodec = EncodingSettings.Codec.hevc
     private var currentBitrate = 2.5
     private var currentImageEncoding = ImageEncodingSettings()
+    private var currentExportsFrame = false
     /// Videos use even dimensions. Images can be cropped one pixel at a time.
     var pixelStep = 2
-    var value: CropEdit { CropEdit(crop: currentCrop, encoding: EncodingSettings(codec: currentCodec, megabitsPerSecond: currentBitrate), imageEncoding: currentImageEncoding) }
+    var value: CropEdit { CropEdit(crop: currentCrop, encoding: EncodingSettings(codec: currentCodec, megabitsPerSecond: currentBitrate), imageEncoding: currentImageEncoding, exportsFrame: currentExportsFrame) }
+    var exportsFrame: Bool { currentExportsFrame }
+    var exportFormat: ExportFormat {
+        get {
+            if exportsFrame { return imageEncoding.format == .png ? .png : .jpeg }
+            return codec == .h264 ? .h264 : .hevc
+        }
+        set {
+            var edit = value
+            edit.exportsFrame = newValue.isImage
+            switch newValue {
+            case .h264: edit.encoding.codec = .h264
+            case .hevc: edit.encoding.codec = .hevc
+            case .png: edit.imageEncoding.format = .png
+            case .jpeg: edit.imageEncoding.format = .jpeg
+            }
+            set(edit)
+        }
+    }
     var imageEncoding: ImageEncodingSettings {
         get { currentImageEncoding }
         set {
@@ -1442,6 +1668,7 @@ final class EditHistory {
         currentCodec = edit.encoding.codec
         currentBitrate = edit.encoding.megabitsPerSecond
         currentImageEncoding = edit.imageEncoding
+        currentExportsFrame = edit.exportsFrame
     }
     private func register(_ previous: CropEdit) {
         let grouping = !manager.isUndoing && !manager.isRedoing
@@ -1829,55 +2056,135 @@ struct CropMargins: Equatable {
 
 // MARK: Playback
 
+/// The presentation time of every video frame, including variable-frame-rate recordings.
+struct VideoFrameIndex: Sendable {
+    let times: [CMTime]
+    
+    /// Read frame positions without decoding the video pixels.
+    static func load(asset: AVAsset, track: AVAssetTrack, duration: Double) throws -> VideoFrameIndex {
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { throw ImageError.unreadableFrame }
+        reader.add(output)
+        guard reader.startReading() else { throw reader.error ?? ImageError.unreadableFrame }
+        defer { reader.cancelReading() }
+        var times: [CMTime] = []
+        while let sample = output.copyNextSampleBuffer() {
+            try Task.checkCancellation()
+            for sampleIndex in 0..<CMSampleBufferGetNumSamples(sample) {
+                var timing = CMSampleTimingInfo()
+                guard CMSampleBufferGetSampleTimingInfo(sample, at: sampleIndex, timingInfoOut: &timing) == noErr else {
+                    throw ImageError.unreadableFrame
+                }
+                let time = timing.presentationTimeStamp
+                if time.isNumeric, time.seconds >= 0, time.seconds < duration { times.append(time) }
+            }
+        }
+        guard reader.status == .completed else { throw reader.error ?? ImageError.unreadableFrame }
+        times.sort { CMTimeCompare($0, $1) < 0 }
+        var uniqueTimes: [CMTime] = []
+        for time in times where uniqueTimes.last.map({ CMTimeCompare($0, time) != 0 }) ?? true {
+            uniqueTimes.append(time)
+        }
+        guard !uniqueTimes.isEmpty else { throw ImageError.unreadableFrame }
+        return VideoFrameIndex(times: uniqueTimes)
+    }
+    
+    /// Find the frame visible at this playback time.
+    func frame(at time: CMTime) -> Int {
+        var lowerBound = 0
+        var upperBound = times.count
+        while lowerBound < upperBound {
+            let middle = lowerBound + (upperBound - lowerBound) / 2
+            if CMTimeCompare(times[middle], time) <= 0 {
+                lowerBound = middle + 1
+            } else {
+                upperBound = middle
+            }
+        }
+        return max(0, lowerBound - 1)
+    }
+}
+
+/// Read the selected frame at full resolution with its original colors and HDR.
+enum VideoFrameExporter {
+    static func image(from url: URL, at time: CMTime) async throws -> ImageSource {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        /// Keep the displayed proportions, including videos with non-square pixels.
+        generator.apertureMode = .cleanAperture
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        generator.dynamicRangePolicy = .matchSource
+        let result = try await withTaskCancellationHandler {
+            try await generator.image(at: time)
+        } onCancel: {
+            generator.cancelAllCGImageGeneration()
+        }
+        try Task.checkCancellation()
+        let image = result.image
+        let profile = image.colorSpace.flatMap { NSColorSpace(cgColorSpace: $0)?.localizedName }
+        return ImageSource(image: image, type: .png, bytes: 0, colorProfileName: profile)
+    }
+}
+
 /// Track playback position and whether the video is playing.
 /// Remove playback observers when the video is closed or replaced.
 @MainActor @Observable
 final class PlaybackState {
-    
     private(set) var position = 0.0
+    private(set) var selectedFrame = 0
     private(set) var isPlaying = false
     private(set) var isMuted = false
-    var duration = 0.0
+    private(set) var duration = 0.0
+    private(set) var frames = VideoFrameIndex(times: [])
     @ObservationIgnored private var player: AVPlayer?
     @ObservationIgnored private var timeObserver: Any?
     @ObservationIgnored private var rateObserver: NSKeyValueObservation?
     @ObservationIgnored private var muteObserver: NSKeyValueObservation?
     @ObservationIgnored private var endObserver: NSObjectProtocol?
+    @ObservationIgnored private var statusObserver: NSKeyValueObservation?
+    @ObservationIgnored private var seekTarget: Int?
+    @ObservationIgnored private var seekInProgress = false
+    @ObservationIgnored private var playbackRateAfterSeek: Float = 0
+    @ObservationIgnored private var holdTask: Task<Void, Never>?
+    @ObservationIgnored private var reverseTimer: Timer?
+    @ObservationIgnored private var heldDirection: Int?
     private var scrubbing = false
     private var resumeAfterScrubbing = false
     private var reachedEnd = false
-    private var restarting = false
     private var operation = UUID()
     
-    var seekPosition: Double {
-        get { min(max(0, position), max(duration, 0.01)) }
+    var frameCount: Int { frames.times.count }
+    var framePosition: Double {
+        get { Double(selectedFrame) }
         set {
-            position = min(max(0, newValue), max(duration, 0.01))
-            reachedEnd = false
-            player?.seek(to: CMTime(seconds: position, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+            let requested = min(max(0, Int(newValue.rounded())), max(0, frameCount - 1))
+            if requested != selectedFrame { seek(to: requested) }
         }
     }
     
-    func connect(to player: AVPlayer?) {
-        guard self.player !== player else { return }
+    func connect(to player: AVPlayer, frames: VideoFrameIndex, duration: Double) {
         disconnect()
         self.player = player
-        position = 0
-        reachedEnd = false
-        guard let player else { return }
-        let current = player.currentTime().seconds
-        if current.isFinite { position = current }
+        self.frames = frames
+        self.duration = duration
+        updatePosition(player.currentTime())
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 60), queue: .main) { [weak self] time in
             MainActor.assumeIsolated {
-                guard let self, !self.scrubbing, time.seconds.isFinite else { return }
-                self.position = time.seconds
+                guard let self, !self.scrubbing, self.reverseTimer == nil, self.seekTarget == nil else { return }
+                self.updatePosition(time)
             }
         }
         rateObserver = player.observe(\.rate, options: [.initial, .new]) { [weak self] observed, _ in
             Task { @MainActor in
                 guard let self, self.player === observed else { return }
-                self.isPlaying = observed.rate != 0 || self.restarting
+                self.isPlaying = observed.rate != 0 || self.playbackRateAfterSeek != 0 || self.reverseTimer != nil
             }
+        }
+        statusObserver = player.currentItem?.observe(\.status, options: [.initial, .new]) { [weak self] _, _ in
+            Task { @MainActor in self?.performPendingSeek() }
         }
         isMuted = player.isMuted
         muteObserver = player.observe(\.isMuted, options: [.new]) { [weak self] observed, _ in
@@ -1892,9 +2199,11 @@ final class PlaybackState {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.reachedEnd = true
-                self.position = self.duration
-                self.isPlaying = false
+                let endedBackward = self.heldDirection == -1
+                self.pause()
+                self.reachedEnd = !endedBackward
+                self.position = endedBackward ? 0 : self.duration
+                self.selectedFrame = endedBackward ? 0 : max(0, self.frameCount - 1)
             }
         }
     }
@@ -1906,102 +2215,232 @@ final class PlaybackState {
         isMuted = player.isMuted
     }
     
+    func pause() {
+        clearFrameHold()
+        playbackRateAfterSeek = 0
+        player?.pause()
+        isPlaying = false
+        resumeAfterScrubbing = false
+    }
+    
+    /// Freeze the selected frame when Export is clicked.
+    func pauseForExport() -> CMTime? {
+        let wasSeeking = seekTarget != nil
+        pause()
+        if !wasSeeking, let player { updatePosition(player.currentTime()) }
+        guard frames.times.indices.contains(selectedFrame) else { return nil }
+        return frames.times[selectedFrame]
+    }
+    
     func togglePlayback() {
-        guard let player else { return }
-        operation = UUID()
-        if player.rate != 0 || restarting {
-            restarting = false
-            player.pause()
-            isPlaying = false
-            return
+        guard player != nil else { return }
+        if isPlaying {
+            pause()
+        } else {
+            seek(to: reachedEnd ? 0 : selectedFrame, rate: 1)
         }
-        let current = player.currentTime().seconds
-        if reachedEnd || (duration > 0 && current.isFinite && current >= duration - 1.0 / 600) {
-            restarting = true
-            isPlaying = true
-            let request = operation
-            player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player] finished in
-                Task { @MainActor in
-                    guard let self, self.operation == request, self.player === player else { return }
-                    self.restarting = false
-                    self.reachedEnd = false
-                    self.position = 0
-                    if finished { player?.play() } else { self.isPlaying = false }
+    }
+    
+    /// Step one frame and leave playback paused.
+    func step(by amount: Int) {
+        if seekTarget == nil, let player { updatePosition(player.currentTime()) }
+        pause()
+        seek(to: selectedFrame + amount)
+    }
+    
+    /// A tap steps once. Holding the key starts normal-speed playback.
+    func beginFrameHold(direction: Int) {
+        guard player != nil, frameCount > 0 else { return }
+        step(by: direction)
+        heldDirection = direction
+        holdTask = Task { @MainActor [weak self] in
+            /// Distinguish a quick frame tap from a held key.
+            do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
+            self?.startHeldPlayback()
+        }
+    }
+    
+    /// Stop on an exact frame when the key is released or the window loses focus.
+    func endFrameHold() {
+        guard heldDirection != nil else { return }
+        pause()
+        if seekTarget == nil, let player { updatePosition(player.currentTime()) }
+        seek(to: selectedFrame)
+    }
+    
+    private func clearFrameHold() {
+        holdTask?.cancel()
+        holdTask = nil
+        reverseTimer?.invalidate()
+        reverseTimer = nil
+        heldDirection = nil
+    }
+    
+    private func startHeldPlayback() {
+        guard player != nil, let heldDirection else { return }
+        if heldDirection > 0 {
+            seek(to: selectedFrame, rate: 1)
+        } else {
+            /// Scrub backward at normal speed using the same seeks as the timeline.
+            let startTime = position
+            let startUptime = ProcessInfo.processInfo.systemUptime
+            let interval = min(1.0 / 60, duration / Double(frameCount))
+            let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    let seconds = max(0, startTime - (ProcessInfo.processInfo.systemUptime - startUptime))
+                    let frame = self.frames.frame(at: CMTime(seconds: seconds, preferredTimescale: 60000))
+                    if frame != self.selectedFrame { self.seek(to: frame) }
+                    if seconds == 0 { self.endFrameHold() }
                 }
             }
-        } else {
-            player.play()
+            reverseTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+            isPlaying = true
         }
     }
     
     /// Pause while dragging the timeline. Resume afterward if the video was playing.
     func setScrubbing(_ editing: Bool) {
-        operation = UUID()
         scrubbing = editing
-        restarting = false
         if editing {
-            resumeAfterScrubbing = (player?.rate ?? 0) != 0
-            player?.pause()
+            let wasPlaying = isPlaying
+            pause()
+            resumeAfterScrubbing = wasPlaying
         } else {
-            let request = operation
             let resume = resumeAfterScrubbing
-            player?.seek(to: CMTime(seconds: seekPosition, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
-                Task { @MainActor in
-                    guard let self, self.operation == request, !self.scrubbing else { return }
-                    if finished && resume { self.player?.play() }
+            resumeAfterScrubbing = false
+            seek(to: selectedFrame, rate: resume ? 1 : 0)
+        }
+    }
+    
+    /// Keep the latest requested frame while the player finishes its current seek.
+    private func seek(to requested: Int, rate: Float = 0) {
+        guard player != nil, frameCount > 0 else { return }
+        selectedFrame = min(max(0, requested), frameCount - 1)
+        position = frames.times[selectedFrame].seconds
+        reachedEnd = false
+        playbackRateAfterSeek = rate
+        isPlaying = rate != 0 || reverseTimer != nil
+        seekTarget = selectedFrame
+        performPendingSeek()
+    }
+    
+    /// Finish one seek before starting the next, as recommended in Apple's QA1820.
+    private func performPendingSeek() {
+        guard !seekInProgress, let target = seekTarget, let player,
+              player.currentItem?.status == .readyToPlay else { return }
+        seekInProgress = true
+        let connection = operation
+        player.seek(to: frames.times[target], toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player] finished in
+            Task { @MainActor in
+                guard let self, self.operation == connection, self.player === player else { return }
+                self.seekInProgress = false
+                if self.seekTarget != target {
+                    self.performPendingSeek()
+                } else {
+                    self.seekTarget = nil
+                    let rate = self.playbackRateAfterSeek
+                    self.playbackRateAfterSeek = 0
+                    if finished { player?.rate = rate }
+                    self.isPlaying = finished && (rate != 0 || self.reverseTimer != nil)
                 }
             }
-            resumeAfterScrubbing = false
         }
+    }
+    
+    private func updatePosition(_ time: CMTime) {
+        guard time.isNumeric else { return }
+        position = min(max(0, time.seconds), duration)
+        selectedFrame = frames.frame(at: time)
     }
     
     func disconnect() {
         operation = UUID()
+        clearFrameHold()
+        seekTarget = nil
+        seekInProgress = false
+        playbackRateAfterSeek = 0
+        player?.pause()
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         timeObserver = nil
         rateObserver?.invalidate()
         rateObserver = nil
+        statusObserver?.invalidate()
+        statusObserver = nil
         muteObserver?.invalidate()
         muteObserver = nil
         isMuted = false
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
         player = nil
+        frames = VideoFrameIndex(times: [])
+        selectedFrame = 0
+        position = 0
+        duration = 0
         scrubbing = false
-        restarting = false
+        resumeAfterScrubbing = false
+        reachedEnd = false
         isPlaying = false
     }
     
     deinit {
+        holdTask?.cancel()
+        reverseTimer?.invalidate()
+        statusObserver?.invalidate()
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
         rateObserver?.invalidate()
         muteObserver?.invalidate()
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
     }
-    
 }
 
-/// Playback, mute, and the video timeline.
-struct PlaybackControls: View {
-    let player: AVPlayer?
-    let duration: Double
-    @State private var playback = PlaybackState()
+/// Reserve room for the full frame count.
+struct PlaybackReadout: View {
+    let text: String
+    let reservation: String
     
     var body: some View {
-        HStack(spacing: 8) {
-            Button(action: playback.togglePlayback) {
-                Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
-                    .frame(width: 18, height: 18)
+        Text(verbatim: reservation)
+            .hidden()
+            .overlay(alignment: .trailing) {
+                Text(verbatim: text)
             }
-            .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
-            Slider(value: $playback.seekPosition, in: 0...max(duration, 0.01), onEditingChanged: playback.setScrubbing)
-                .accessibilityLabel("Playback position")
-            Text(
-                "\(playback.seekPosition.formatted(.number.precision(.fractionLength(1)).locale(CropFormatting.locale))) / \(duration.formatted(.number.precision(.fractionLength(1)).locale(CropFormatting.locale))) s"
-            )
-            .monospacedDigit()
             .font(.caption)
+            .monospacedDigit()
             .fixedSize()
+    }
+}
+
+/// Playback, frame scrubbing, frame stepping, time, and mute.
+struct PlaybackControls: View {
+    @Bindable var playback: PlaybackState
+    
+    var body: some View {
+        let totalFrames = String(playback.frameCount)
+        let totalSeconds = playback.duration.formatted(CropFormatting.seconds)
+        let currentSeconds = playback.position.formatted(CropFormatting.seconds)
+        
+        HStack(spacing: 8) {
+            HStack(spacing: 4) {
+                FramePlaybackButton(playback: playback, direction: -1)
+                    .disabled(playback.selectedFrame == 0)
+                    .help("Previous frame ([)")
+                Button(action: playback.togglePlayback) {
+                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
+                        .frame(width: 18, height: 18)
+                }
+                .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
+                .help(playback.isPlaying ? "Pause (⌘↩)" : "Play (⌘↩)")
+                FramePlaybackButton(playback: playback, direction: 1)
+                    .disabled(playback.selectedFrame >= playback.frameCount - 1)
+                    .help("Next frame (])")
+            }
+            PlaybackTimeline(playback: playback)
+                .disabled(playback.frameCount < 2)
+            PlaybackReadout(text: "\(playback.selectedFrame + 1)/\(totalFrames)", reservation: "\(totalFrames)/\(totalFrames)")
+                .accessibilityLabel("Frame \(playback.selectedFrame + 1) of \(playback.frameCount)")
+                .help("\(currentSeconds) / \(totalSeconds) s")
             /// Both speaker icons use the same space so muting cannot resize the timeline.
             Button(action: playback.toggleMute) {
                 Image(systemName: playback.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
@@ -2010,13 +2449,286 @@ struct PlaybackControls: View {
             .accessibilityLabel(playback.isMuted ? "Unmute" : "Mute")
             .help(playback.isMuted ? "Unmute" : "Mute")
         }
-        .disabled(player == nil)
-        .onChange(of: player, initial: true) {
-            playback.duration = duration
-            playback.connect(to: player)
+        .disabled(playback.frameCount == 0)
+    }
+}
+
+/// Jump to clicked frames and show time above the thumb while hovering or scrubbing.
+struct PlaybackTimeline: NSViewRepresentable {
+    let playback: PlaybackState
+    @Environment(\.isEnabled) private var isEnabled
+    
+    func makeNSView(context: Context) -> FrameTimelineSlider {
+        let slider = FrameTimelineSlider()
+        slider.setAccessibilityLabel("Video frame")
+        return slider
+    }
+    
+    func updateNSView(_ slider: FrameTimelineSlider, context: Context) {
+        slider.playback = playback
+        let maximum = Double(max(1, playback.frameCount - 1))
+        if slider.maxValue != maximum { slider.maxValue = maximum }
+        slider.updatePosition()
+        if slider.isEnabled != isEnabled {
+            slider.isEnabled = isEnabled
+            if !isEnabled { slider.cancelInteraction() }
         }
-        .onChange(of: duration) { playback.duration = duration }
-        .onDisappear { playback.disconnect() }
+        slider.updateTimeBubble()
+    }
+    
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: FrameTimelineSlider, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 160, height: nsView.intrinsicContentSize.height)
+    }
+    
+    static func dismantleNSView(_ slider: FrameTimelineSlider, coordinator: ()) {
+        slider.cancelInteraction()
+    }
+}
+
+/// Keep the native slider's appearance and keyboard controls, with instant mouse seeking.
+final class FrameTimelineSlider: NSSlider {
+    weak var playback: PlaybackState?
+    private var scrubbing = false
+    private var hovering = false
+    private var hoverArea: NSTrackingArea?
+    private var resignObserver: NSObjectProtocol?
+    private let timeBubble = NSPanel(
+        contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+    private let timeLabel = NSTextField(labelWithString: "")
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        target = self
+        action = #selector(changeFrame(_:))
+        isContinuous = true
+        minValue = 0
+        numberOfTickMarks = 0
+        timeLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        timeLabel.alignment = .center
+        /// The time bubble never takes focus from the slider or playback controls.
+        timeBubble.isReleasedWhenClosed = false
+        timeBubble.isOpaque = false
+        timeBubble.backgroundColor = .clear
+        timeBubble.hasShadow = true
+        timeBubble.animationBehavior = .none
+        timeBubble.ignoresMouseEvents = true
+        timeBubble.hidesOnDeactivate = true
+        timeBubble.isExcludedFromWindowsMenu = true
+        let background = NSVisualEffectView()
+        background.material = .toolTip
+        background.blendingMode = .withinWindow
+        background.state = .active
+        background.wantsLayer = true
+        background.layer?.cornerRadius = 6
+        background.layer?.masksToBounds = true
+        background.addSubview(timeLabel)
+        timeBubble.contentView = background
+    }
+    
+    required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
+    
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        cancelInteraction()
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+        resignObserver = nil
+        guard let window else { return }
+        resignObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.cancelInteraction() }
+        }
+    }
+    
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        hoverArea = area
+        addTrackingArea(area)
+    }
+    
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true
+        updateTimeBubble()
+    }
+    
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        updateTimeBubble()
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled, let sliderCell = cell as? NSSliderCell else { return }
+        scrubbing = true
+        playback?.setScrubbing(true)
+        
+        /// Jump to a clicked frame before AppKit starts dragging the thumb.
+        let point = convert(event.locationInWindow, from: nil)
+        if !sliderCell.knobRect(flipped: isFlipped).contains(point) {
+            let travel = bounds.insetBy(dx: sliderCell.knobThickness / 2, dy: 0)
+            let fraction = min(1, max(0, (point.x - travel.minX) / max(1, travel.width)))
+            doubleValue = (minValue + Double(fraction) * (maxValue - minValue)).rounded()
+            changeFrame(self)
+            displayIfNeeded()
+        }
+        
+        /// AppKit tracks the thumb until the mouse button is released.
+        super.mouseDown(with: event)
+        guard scrubbing else { return }
+        scrubbing = false
+        playback?.setScrubbing(false)
+        updatePosition()
+        updateTimeBubble()
+    }
+    
+    /// Let AppKit move the thumb during a drag. Playback uses whole frames.
+    func updatePosition() {
+        guard !scrubbing, let playback else { return }
+        if doubleValue != playback.framePosition { doubleValue = playback.framePosition }
+    }
+    
+    @objc private func changeFrame(_ sender: Any?) {
+        if !scrubbing { playback?.pause() }
+        playback?.framePosition = doubleValue
+        updatePosition()
+        updateTimeBubble()
+    }
+    
+    /// Position the time bubble at the selected frame before the slider redraws.
+    private var thumbRect: NSRect {
+        guard let sliderCell = cell as? NSSliderCell else { return .zero }
+        var knob = sliderCell.knobRect(flipped: isFlipped)
+        let fraction = min(1, max(0, (doubleValue - minValue) / max(1, maxValue - minValue)))
+        let travel = bounds.insetBy(dx: sliderCell.knobThickness / 2, dy: 0)
+        knob.origin.x = travel.minX + CGFloat(fraction) * max(0, travel.width) - knob.width / 2
+        return knob
+    }
+    
+    func updateTimeBubble() {
+        guard isEnabled, hovering || scrubbing, let window,
+              let playback else {
+            hideTimeBubble()
+            return
+        }
+        timeLabel.stringValue = "\(playback.position.formatted(CropFormatting.seconds)) s"
+        let size = timeLabel.fittingSize
+        timeLabel.frame = NSRect(x: 8, y: 6, width: size.width, height: size.height)
+        let knob = window.convertToScreen(convert(thumbRect, to: nil))
+        let frame = NSRect(x: knob.midX - (size.width + 16) / 2, y: knob.maxY + 6, width: size.width + 16, height: size.height + 12)
+        if timeBubble.appearance !== window.effectiveAppearance {
+            timeBubble.appearance = window.effectiveAppearance
+        }
+        timeBubble.setFrame(frame, display: true)
+        if timeBubble.parent !== window {
+            timeBubble.parent?.removeChildWindow(timeBubble)
+            window.addChildWindow(timeBubble, ordered: .above)
+        }
+        if !timeBubble.isVisible { timeBubble.orderFront(nil) }
+    }
+    
+    private func hideTimeBubble() {
+        timeBubble.orderOut(nil)
+        timeBubble.parent?.removeChildWindow(timeBubble)
+    }
+    
+    /// Stop scrubbing and hide the time when leaving the window or closing the video.
+    func cancelInteraction() {
+        hovering = false
+        if scrubbing {
+            scrubbing = false
+            playback?.pause()
+            playback?.setScrubbing(false)
+        }
+        hideTimeBubble()
+    }
+    
+    deinit {
+        timeBubble.close()
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+    }
+}
+
+/// Native frame buttons share the keyboard's tap and hold behavior.
+struct FramePlaybackButton: NSViewRepresentable {
+    let playback: PlaybackState
+    let direction: Int
+    @Environment(\.isEnabled) private var isEnabled
+    
+    func makeNSView(context: Context) -> FrameHoldButton {
+        let button = FrameHoldButton()
+        button.bezelStyle = .push
+        button.setButtonType(.momentaryPushIn)
+        button.imagePosition = .imageOnly
+        button.image = NSImage(systemSymbolName: direction < 0 ? "backward.frame.fill" : "forward.frame.fill", accessibilityDescription: nil)
+        button.image?.size = NSSize(width: 18, height: 18)
+        button.setAccessibilityLabel(direction < 0 ? "Previous Frame" : "Next Frame")
+        return button
+    }
+    
+    func updateNSView(_ button: FrameHoldButton, context: Context) {
+        button.playback = playback
+        button.direction = direction
+        if button.isEnabled != isEnabled {
+            button.isEnabled = isEnabled
+            if !isEnabled { button.endMouseHold() }
+        }
+    }
+    
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: FrameHoldButton, context: Context) -> CGSize? {
+        nsView.intrinsicContentSize
+    }
+    
+    static func dismantleNSView(_ button: FrameHoldButton, coordinator: ()) {
+        button.endMouseHold()
+    }
+}
+
+/// Release stops playback. Keyboard and accessibility clicks still step one frame.
+final class FrameHoldButton: NSButton {
+    weak var playback: PlaybackState?
+    var direction = 1
+    private var trackingMouse = false
+    private var pointerInside = false
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        target = self
+        action = #selector(stepOnce(_:))
+    }
+    
+    required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
+    
+    @objc private func stepOnce(_ sender: Any?) {
+        playback?.step(by: direction)
+    }
+    
+    override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
+        trackingMouse = true
+        pointerInside = true
+        highlight(true)
+        playback?.beginFrameHold(direction: direction)
+    }
+    
+    /// Leaving the button stops the hold. Dragging back onto it starts it again.
+    override func mouseDragged(with event: NSEvent) {
+        guard trackingMouse else { return }
+        let inside = isEnabled && bounds.contains(convert(event.locationInWindow, from: nil))
+        guard inside != pointerInside else { return }
+        pointerInside = inside
+        highlight(inside)
+        if inside { playback?.beginFrameHold(direction: direction) } else { playback?.endFrameHold() }
+    }
+    
+    override func mouseUp(with event: NSEvent) {
+        endMouseHold()
+    }
+    
+    func endMouseHold() {
+        guard trackingMouse else { return }
+        trackingMouse = false
+        pointerInside = false
+        highlight(false)
+        playback?.endFrameHold()
     }
 }
 
@@ -2035,6 +2747,7 @@ struct CropCanvas: NSViewRepresentable {
     let centerCameraOnRequest: Bool
     let framingInsets: NSEdgeInsets
     let history: EditHistory
+    let playback: PlaybackState?
     let windowIdentity: UUID
     let canvasColor: NSColor
     let onFit: () -> Void
@@ -2055,6 +2768,7 @@ struct CropCanvas: NSViewRepresentable {
         view.onFit = onFit
         view.onExitPreview = onExitPreview
         view.history = history
+        view.playback = playback
         view.update(
             player: player, image: image, size: sourceSize, crop: crop, zoom: zoom, fit: fit,
             previewOnly: previewOnly, request: cameraRequest, insets: framingInsets, centerCameraOnRequest: centerCameraOnRequest
@@ -2072,6 +2786,16 @@ final class CanvasScrollView: NSScrollView {
     private var previewOnly = false
     private var layingOut = false
     private var eventMonitor: Any?
+    private var resignKeyObserver: NSObjectProtocol?
+    private var heldFrameKey: UInt16?
+    weak var playback: PlaybackState? {
+        didSet {
+            if oldValue !== playback {
+                oldValue?.endFrameHold()
+                heldFrameKey = nil
+            }
+        }
+    }
     private var animationTimer: Timer?
     private var scrollCursorReset: DispatchWorkItem?
     private var trackpadPanning = false
@@ -2081,7 +2805,8 @@ final class CanvasScrollView: NSScrollView {
     private var insets = NSEdgeInsets()
     private var publishedZoom = -1.0
     private var lastViewportSize = CGSize.zero
-    private(set) var spaceHeld = false
+    private var heldHandKey: UInt16?
+    var handToolHeld: Bool { heldHandKey != nil }
     private(set) var isPanning = false
     private var panOrigin = CGPoint.zero
     private var panScrollOrigin = CGPoint.zero
@@ -2151,14 +2876,37 @@ final class CanvasScrollView: NSScrollView {
         
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
         eventMonitor = nil
+        stopCanvasKeys()
+        if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
+        resignKeyObserver = nil
         guard let window else {
             stopAnimation()
             return
         }
         
+        resignKeyObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stopCanvasKeys() }
+        }
         if let windowIdentity { CropWindowRegistry.shared.attach(window, identity: windowIdentity) }
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .scrollWheel, .magnify, .smartMagnify]) { [weak self] event in
             guard let self, event.window === self.window || self.window?.isKeyWindow == true else { return event }
+            /// Key-up ends the hold even if focus or modifier keys changed meanwhile.
+            if event.type == .keyUp, self.heldFrameKey == event.keyCode {
+                self.stopFrameKey()
+                return nil
+            }
+            if event.type == .keyDown, self.window?.isKeyWindow == true,
+               !(self.window?.firstResponder is NSTextView),
+               event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+               let playback = self.playback, playback.frameCount > 0,
+               let character = event.charactersIgnoringModifiers, character == "[" || character == "]" {
+                if !event.isARepeat {
+                    self.stopFrameKey()
+                    self.heldFrameKey = event.keyCode
+                    playback.beginFrameHold(direction: character == "[" ? -1 : 1)
+                }
+                return nil
+            }
             let command = event.modifierFlags.contains(.command) || NSEvent.modifierFlags.contains(.command)
             if event.type == .scrollWheel && command {
                 self.commandScroll(event)
@@ -2172,11 +2920,16 @@ final class CanvasScrollView: NSScrollView {
                 self.zoomAroundPointer(event, factor: max(0.1, 1 + event.magnification))
                 return nil
             }
-            if (event.type == .keyDown || event.type == .keyUp) && event.keyCode == 49,
-               !(self.window?.firstResponder is NSTextView), !command
-            {
-                self.spaceHeld = event.type == .keyDown
-                self.window?.invalidateCursorRects(for: self.canvas.overlay)
+            /// Hold H to pan the canvas.
+            if event.type == .keyUp, self.heldHandKey == event.keyCode {
+                self.setHandToolKey(nil)
+                return nil
+            }
+            if event.type == .keyDown, self.window?.isKeyWindow == true,
+               !(self.window?.firstResponder is NSTextView),
+               event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+               event.charactersIgnoringModifiers?.lowercased() == "h" {
+                self.setHandToolKey(event.keyCode)
                 return nil
             }
             if event.type == .keyDown {
@@ -2189,7 +2942,27 @@ final class CanvasScrollView: NSScrollView {
         }
     }
     
+    private func setHandToolKey(_ keyCode: UInt16?) {
+        guard heldHandKey != keyCode else { return }
+        heldHandKey = keyCode
+        window?.invalidateCursorRects(for: self)
+        window?.invalidateCursorRects(for: canvas.overlay)
+    }
+    
+    /// Release held controls when leaving the canvas window.
+    private func stopCanvasKeys() {
+        stopFrameKey()
+        setHandToolKey(nil)
+        endPan()
+    }
+    
+    private func stopFrameKey() {
+        heldFrameKey = nil
+        playback?.endFrameHold()
+    }
+    
     deinit {
+        if let resignKeyObserver { NotificationCenter.default.removeObserver(resignKeyObserver) }
         animationTimer?.invalidate()
         scrollCursorReset?.cancel()
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
@@ -2197,7 +2970,7 @@ final class CanvasScrollView: NSScrollView {
     
     override func resetCursorRects() {
         super.resetCursorRects()
-        if showingPanCursor || spaceHeld { addCursorRect(bounds, cursor: showingPanCursor ? .closedHand : .openHand) }
+        if showingPanCursor || handToolHeld { addCursorRect(bounds, cursor: showingPanCursor ? .closedHand : .openHand) }
     }
     
     override func layout() {
@@ -2350,7 +3123,7 @@ final class CanvasScrollView: NSScrollView {
     
     /// Start panning the canvas.
     func beginPan(with event: NSEvent) {
-        guard event.buttonNumber == 2 || event.buttonNumber == 1 || spaceHeld else { return }
+        guard event.buttonNumber == 2 || event.buttonNumber == 1 || handToolHeld else { return }
         stopAnimation()
         isPanning = true
         panOrigin = event.locationInWindow
@@ -2507,7 +3280,7 @@ final class VideoCanvasView: NSView {
     }
     
     override func mouseDown(with event: NSEvent) {
-        if let scroll = enclosingScrollView as? CanvasScrollView, scroll.spaceHeld {
+        if let scroll = enclosingScrollView as? CanvasScrollView, scroll.handToolHeld {
             scroll.beginPan(with: event)
             return
         }
@@ -2696,7 +3469,7 @@ final class CropOverlayView: NSView {
     
     override func resetCursorRects() {
         guard editingEnabled, sourceSize.width > 0 else { return }
-        if let scroll = enclosingScrollView as? CanvasScrollView, scroll.spaceHeld || scroll.showingPanCursor {
+        if let scroll = enclosingScrollView as? CanvasScrollView, scroll.handToolHeld || scroll.showingPanCursor {
             addCursorRect(bounds, cursor: scroll.showingPanCursor ? .closedHand : .openHand)
             return
         }
@@ -2713,7 +3486,7 @@ final class CropOverlayView: NSView {
     
     override func mouseDown(with event: NSEvent) {
         guard sourceSize.width > 0 else { return }
-        if let scroll = enclosingScrollView as? CanvasScrollView, scroll.spaceHeld {
+        if let scroll = enclosingScrollView as? CanvasScrollView, scroll.handToolHeld {
             scroll.beginPan(with: event)
             return
         }
@@ -2851,6 +3624,10 @@ struct ImageSource: @unchecked Sendable {
     let bytes: Int64
     let colorProfileName: String?
     
+    var isHDR: Bool {
+        image.contentHeadroom > 1 || image.colorSpace.map { CGColorSpaceUsesITUR_2100TF($0) } == true
+    }
+    
     var hasTransparency: Bool {
         [.first, .last, .premultipliedFirst, .premultipliedLast, .alphaOnly].contains(image.alphaInfo)
     }
@@ -2870,7 +3647,7 @@ struct ImageSource: @unchecked Sendable {
             throw ImageError.unsupported
         }
         guard CGImageSourceGetCount(source) == 1 else { throw ImageError.multipleImages }
-        guard let original = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else {
+        guard let original = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true, kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR] as CFDictionary) else {
             throw ImageError.unreadable
         }
         let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
@@ -2880,6 +3657,7 @@ struct ImageSource: @unchecked Sendable {
             image = original
         } else {
             let options: [CFString: Any] = [
+                kCGImageSourceDecodeRequest: kCGImageSourceDecodeToHDR,
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
                 kCGImageSourceThumbnailMaxPixelSize: max(original.width, original.height),
@@ -2897,9 +3675,9 @@ struct ImageSource: @unchecked Sendable {
     }
 }
 
-/// Errors shown when an image cannot be opened or exported.
+/// Errors shown when an image or video frame cannot be read or exported.
 enum ImageError: LocalizedError {
-    case unsupported, multipleImages, unreadable, invalidCrop, encodingFailed
+    case unsupported, multipleImages, unreadable, invalidCrop, encodingFailed, unreadableFrame
     
     var errorDescription: String? {
         switch self {
@@ -2908,39 +3686,47 @@ enum ImageError: LocalizedError {
         case .unreadable: "This image could not be read."
         case .invalidCrop: "The crop must stay inside the image and contain at least one pixel."
         case .encodingFailed: "The cropped image could not be exported."
+        case .unreadableFrame: "This video frame could not be read."
         }
     }
 }
 
 /// Crop at the original pixel size and save only the image and its color profile.
 enum ImageExporter {
+    private static let imageContext = CIContext(options: [.cacheIntermediates: false])
+    
     static func export(source: ImageSource, destination: URL, crop: CGRect, settings: ImageEncodingSettings) throws {
         try Task.checkCancellation()
         let bounds = CGRect(x: 0, y: 0, width: source.image.width, height: source.image.height)
         guard crop.width >= 1, crop.height >= 1, crop == crop.integral, bounds.contains(crop),
               let cropped = source.image.cropping(to: crop) else { throw ImageError.invalidCrop }
-        let output: CGImage
-        if settings.format == .jpeg && source.hasTransparency {
-            /// JPEG cannot store transparency. Draw the chosen background behind the crop.
-            let colorSpace = cropped.colorSpace.flatMap { $0.model == .rgb ? $0 : nil } ?? CGColorSpace(name: CGColorSpace.sRGB)!
-            guard let context = CGContext(
-                data: nil, width: cropped.width, height: cropped.height, bitsPerComponent: 8, bytesPerRow: 0,
-                space: colorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { throw ImageError.encodingFailed }
-            let background = CGColor(colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!, components: [settings.background.red, settings.background.green, settings.background.blue, 1])!
-            context.setFillColor(background)
-            context.fill(CGRect(x: 0, y: 0, width: cropped.width, height: cropped.height))
-            context.draw(cropped, in: CGRect(x: 0, y: 0, width: cropped.width, height: cropped.height))
-            guard let flattened = context.makeImage() else { throw ImageError.encodingFailed }
-            output = flattened
-        } else {
-            output = cropped
-        }
         guard let destination = CGImageDestinationCreateWithURL(destination as CFURL, settings.format.contentType.identifier as CFString, 1, nil) else {
             throw ImageError.encodingFailed
         }
-        var properties: [CFString: Any] = [:]
+        var properties: [CFString: Any] = [kCGImageDestinationOptimizeColorForSharing: false]
+        if source.isHDR {
+            /// PNG stores the HDR pixels. JPEG includes an HDR gain map and an SDR image.
+            properties[kCGImageDestinationEncodeRequest] = settings.format == .png
+            ? kCGImageDestinationEncodeToISOHDR : kCGImageDestinationEncodeToISOGainmap
+        }
         if settings.format == .jpeg {
             properties[kCGImageDestinationLossyCompressionQuality] = min(1, max(0, settings.quality))
+            if source.hasTransparency {
+                /// JPEG fills transparent pixels with the selected color.
+                let background = CGColor(colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!, components: [settings.background.red, settings.background.green, settings.background.blue, 1])!
+                properties[kCGImageDestinationBackgroundColor] = background
+            }
+        }
+        let output: CGImage
+        if source.isHDR && settings.format == .png && cropped.colorSpace.map({ CGColorSpaceUsesITUR_2100TF($0) }) != true {
+            /// PNG needs a nonlinear HDR profile to store floating-point HDR pixels.
+            let colorSpace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)!
+            guard let rendered = imageContext.createCGImage(
+                CIImage(cgImage: cropped), from: CGRect(x: 0, y: 0, width: cropped.width, height: cropped.height),
+                format: .RGBA16, colorSpace: colorSpace) else { throw ImageError.encodingFailed }
+            output = rendered
+        } else {
+            output = cropped
         }
         CGImageDestinationAddImage(destination, output, properties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw ImageError.encodingFailed }
@@ -2968,31 +3754,41 @@ struct ImageEncodingSection: View {
                 .labelsHidden()
                 .fixedSize()
             }
-            if history.imageEncoding.format == .jpeg {
-                HStack {
-                    Text("Quality")
+            ImageQualityControls(history: history, hasTransparency: hasTransparency)
+        }
+    }
+}
+
+/// JPEG quality and the fill color for transparent pixels.
+struct ImageQualityControls: View {
+    @Bindable var history: EditHistory
+    let hasTransparency: Bool
+    
+    var body: some View {
+        if history.imageEncoding.format == .jpeg {
+            HStack {
+                Text("Quality")
+                Spacer()
+                Text("\(Int((history.imageEncoding.quality * 100).rounded()))%")
+                    .monospacedDigit()
+                CropResetButton("Reset Quality") { history.imageEncoding.quality = ImageEncodingSettings().quality }
+            }
+            Slider(value: $history.imageEncoding.quality, in: 0...1, step: 0.01) { editing in
+                if editing { history.begin() } else { history.end() }
+            }
+            .accessibilityLabel("JPEG quality")
+            .help("Higher quality produces larger files")
+            if hasTransparency {
+                HStack(alignment: .center) {
+                    Text("Fill Color")
                     Spacer()
-                    Text("\(Int((history.imageEncoding.quality * 100).rounded()))%")
-                        .monospacedDigit()
-                    CropResetButton("Reset Quality") { history.imageEncoding.quality = ImageEncodingSettings().quality }
-                }
-                Slider(value: $history.imageEncoding.quality, in: 0...1, step: 0.01) { editing in
-                    if editing { history.begin() } else { history.end() }
-                }
-                .accessibilityLabel("JPEG quality")
-                .help("Higher quality produces larger files")
-                if hasTransparency {
-                    HStack(alignment: .center) {
-                        Text("Fill Color")
-                        Spacer()
-                        ColorPicker("Fill Color", selection: Binding(
-                            get: { history.imageEncoding.background.color },
-                            set: { history.imageEncoding.background = ImageBackground($0) }), supportsOpacity: false)
-                        .labelsHidden()
-                        .fixedSize()
-                        .help("Fill transparent areas")
-                        CropResetButton("Reset JPEG Background") { history.imageEncoding.background = ImageBackground() }
-                    }
+                    ColorPicker("Fill Color", selection: Binding(
+                        get: { history.imageEncoding.background.color },
+                        set: { history.imageEncoding.background = ImageBackground($0) }), supportsOpacity: false)
+                    .labelsHidden()
+                    .fixedSize()
+                    .help("Fill transparent areas")
+                    CropResetButton("Reset JPEG Background") { history.imageEncoding.background = ImageBackground() }
                 }
             }
         }
@@ -3000,7 +3796,7 @@ struct ImageEncodingSection: View {
 }
 
 /// Show the exported image and its file information before saving.
-struct ImageReviewView: View {
+struct ExportImageView: View {
     let image: NSImage
     let summary: ExportSummary
     
@@ -3008,6 +3804,7 @@ struct ImageReviewView: View {
         ZStack(alignment: .topLeading) {
             Color(nsColor: .windowBackgroundColor)
             Image(nsImage: image)
+                .allowedDynamicRange(.high)
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3311,9 +4108,9 @@ enum VideoExporter {
     }
 }
 
-// MARK: Export Review and Storage
+// MARK: Export Windows and Storage
 
-/// File information shown in the export review window.
+/// File information shown in the export window.
 struct ExportSummary {
     let codec: String
     let bitrate: Double
@@ -3330,7 +4127,7 @@ struct ExportInformation: View {
     
     private var description: String {
         if let format = summary.imageFormat {
-            return "\(format) · \(Int(summary.resolution.width)) × \(Int(summary.resolution.height)) px · \(summary.bytes.formatted(.byteCount(style: .file).locale(CropFormatting.locale)))"
+            return "\(format)\(summary.isHDR ? " · HDR" : "") · \(Int(summary.resolution.width)) × \(Int(summary.resolution.height)) px · \(summary.bytes.formatted(.byteCount(style: .file).locale(CropFormatting.locale)))"
         }
         return "\(summary.codec) · \(summary.isHDR ? "HDR" : "SDR") · \(Int(summary.resolution.width)) × \(Int(summary.resolution.height)) · \(summary.bitrate.formatted(.number.precision(.fractionLength(2)).locale(CropFormatting.locale))) Mbps · \(summary.bytes.formatted(.byteCount(style: .file).locale(CropFormatting.locale))) · exported in \(summary.elapsed.formatted(.number.precision(.fractionLength(1)).locale(CropFormatting.locale))) s"
     }
@@ -3346,19 +4143,31 @@ struct ExportInformation: View {
     }
 }
 
-/// The export review window and its Save and Discard behavior.
-final class ExportReviewDocument: NSDocument {
+/// The export window and its Save and Discard behavior.
+final class ExportDocument: NSDocument {
     
     private let temporaryExportURL: URL
+    private let temporaryDirectory: URL
     private weak var parentWindow: NSWindow?
     private let contentType: UTType
-    private var reviewPlayer: AVPlayer?
+    private var exportPlayer: AVPlayer?
     private let summary: ExportSummary
     private var loopEnabled = false
     private var endObserver: NSObjectProtocol?
     
-    init(exportURL: URL, title: String, summary: ExportSummary, contentType: UTType = .quickTimeMovie, parentWindow: NSWindow? = nil) {
-        temporaryExportURL = exportURL
+    init(exportURL: URL, title: String, summary: ExportSummary, contentType: UTType = .quickTimeMovie, parentWindow: NSWindow? = nil) throws {
+        /// Give the dragged file the same name as the export window.
+        let directory = exportURL.deletingLastPathComponent().appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let namedExport = directory.appendingPathComponent(title).appendingPathExtension(exportURL.pathExtension)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.moveItem(at: exportURL, to: namedExport)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        temporaryDirectory = directory
+        temporaryExportURL = namedExport
         self.parentWindow = parentWindow
         self.contentType = contentType
         self.summary = summary
@@ -3376,19 +4185,14 @@ final class ExportReviewDocument: NSDocument {
     
     /// Images get a still preview. Videos use the standard playback controls.
     override func makeWindowControllers() {
-        if contentType.conforms(to: .image), let image = NSImage(contentsOf: temporaryExportURL) {
-            let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-            window.contentView = NSHostingView(rootView: ImageReviewView(image: image, summary: summary))
-            window.title = displayName
-            positionReview(window)
-            addWindowController(NSWindowController(window: window))
+        if contentType.conforms(to: .image), let source = try? ImageSource.load(temporaryExportURL) {
+            let image = NSImage(cgImage: source.image, size: .zero)
+            addExportWindow(content: NSHostingView(rootView: ExportImageView(image: image, summary: summary)))
             return
         }
         let playerView = AVPlayerView()
         let player = AVPlayer(url: temporaryExportURL)
-        reviewPlayer = player
+        exportPlayer = player
         playerView.player = player
         playerView.controlsStyle = .floating
         playerView.showsFullScreenToggleButton = true
@@ -3416,27 +4220,55 @@ final class ExportReviewDocument: NSDocument {
                 information.trailingAnchor.constraint(lessThanOrEqualTo: overlay.trailingAnchor, constant: -12),
             ])
         }
+        addExportWindow(content: playerView)
+    }
+    
+    /// Images and videos use the same export window and file icon.
+    private func addExportWindow(content: NSView) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.contentView = playerView
-        window.title = displayName
-        window.subtitle = ""
-        positionReview(window)
-        addWindowController(NSWindowController(window: window))
+        window.contentView = content
+        let controller = ExportWindowController(window: window)
+        addWindowController(controller)
+        window.delegate = controller
+        controller.synchronizeWindowTitleWithDocumentName()
+        positionExportWindow(window)
     }
     
-    /// Center the review over the exporting window and keep it on screen.
-    private func positionReview(_ window: NSWindow) {
+    /// The file represented by the title-bar icon, before or after saving.
+    var exportFileURL: URL { fileURL ?? temporaryExportURL }
+    
+    /// Copy the full image, including its original PNG or JPEG data.
+    @objc func copy(_ sender: Any?) {
+        guard contentType.conforms(to: .image),
+              let data = try? Data(contentsOf: temporaryExportURL) else { return }
+        let item = NSPasteboardItem()
+        item.setData(data, forType: NSPasteboard.PasteboardType(contentType.identifier))
+        /// TIFF lets apps that do not read PNG or JPEG from the clipboard paste the image too.
+        if let tiff = NSImage(data: data)?.tiffRepresentation {
+            item.setData(tiff, forType: .tiff)
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([item])
+    }
+    
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(copy(_:)) { return contentType.conforms(to: .image) }
+        return super.validateUserInterfaceItem(item)
+    }
+    
+    /// Center the export window over the exporting window and keep it on screen.
+    private func positionExportWindow(_ window: NSWindow) {
         guard let screen = parentWindow?.screen ?? NSScreen.main else { return }
         let visibleFrame = screen.visibleFrame
         let parentFrame = parentWindow?.frame ?? visibleFrame
-        var reviewFrame = window.frame
-        reviewFrame.size.width = min(reviewFrame.width, visibleFrame.width)
-        reviewFrame.size.height = min(reviewFrame.height, visibleFrame.height)
-        reviewFrame.origin.x = min(max(parentFrame.midX - reviewFrame.width / 2, visibleFrame.minX), visibleFrame.maxX - reviewFrame.width)
-        reviewFrame.origin.y = min(max(parentFrame.midY - reviewFrame.height / 2, visibleFrame.minY), visibleFrame.maxY - reviewFrame.height)
-        window.setFrame(reviewFrame, display: false)
+        var exportWindowFrame = window.frame
+        exportWindowFrame.size.width = min(exportWindowFrame.width, visibleFrame.width)
+        exportWindowFrame.size.height = min(exportWindowFrame.height, visibleFrame.height)
+        exportWindowFrame.origin.x = min(max(parentFrame.midX - exportWindowFrame.width / 2, visibleFrame.minX), visibleFrame.maxX - exportWindowFrame.width)
+        exportWindowFrame.origin.y = min(max(parentFrame.midY - exportWindowFrame.height / 2, visibleFrame.minY), visibleFrame.maxY - exportWindowFrame.height)
+        window.setFrame(exportWindowFrame, display: false)
     }
     
     /// Turn looping on or off in the player menu.
@@ -3454,27 +4286,51 @@ final class ExportReviewDocument: NSDocument {
         return true
     }
     
-    /// Save a copy of the reviewed export.
+    /// Save a copy of the export.
     override func write(to url: URL, ofType typeName: String) throws {
         try FileManager.default.copyItem(at: temporaryExportURL, to: url)
     }
     
-    /// Close the review and delete its temporary export after saving or discarding it.
+    /// Close the export window and delete its temporary export after saving or discarding it.
     override func close() {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
-        reviewPlayer?.pause()
-        reviewPlayer?.replaceCurrentItem(with: nil)
-        reviewPlayer = nil
+        exportPlayer?.pause()
+        exportPlayer?.replaceCurrentItem(with: nil)
+        exportPlayer = nil
         super.close()
-        try? FileManager.default.removeItem(at: temporaryExportURL)
+        try? FileManager.default.removeItem(at: temporaryDirectory)
     }
     
     deinit {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        try? FileManager.default.removeItem(at: temporaryExportURL)
+        try? FileManager.default.removeItem(at: temporaryDirectory)
     }
     
+}
+
+/// Keep the export window's file icon in sync with Save and allow dragging the export.
+final class ExportWindowController: NSWindowController, NSWindowDelegate, NSDraggingSource {
+    override func synchronizeWindowTitleWithDocumentName() {
+        super.synchronizeWindowTitleWithDocumentName()
+        window?.representedURL = (document as? ExportDocument)?.exportFileURL
+    }
+    
+    /// Drag a copy of the file while keeping the export window available.
+    func window(_ window: NSWindow, shouldDragDocumentWith event: NSEvent, from dragImageLocation: NSPoint, with pasteboard: NSPasteboard) -> Bool {
+        guard let url = (document as? ExportDocument)?.exportFileURL,
+              let content = window.contentView else { return false }
+        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        let frame = content.convert(NSRect(origin: dragImageLocation, size: NSSize(width: 16, height: 16)), from: nil)
+        item.setDraggingFrame(frame, contents: icon)
+        content.beginDraggingSession(with: [item], event: event, source: self)
+        return false
+    }
+    
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        .copy
+    }
 }
 
 /// Store temporary exports and clean up files left by a previous app crash.

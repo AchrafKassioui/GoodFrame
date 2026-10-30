@@ -16,7 +16,7 @@ struct GoodFrameApp: App {
     var body: some Scene {
         WindowGroup(id: "cropper", for: UUID.self) { identity in
             EditorView(windowIdentity: identity.wrappedValue)
-                .frame(minWidth: 900, minHeight: 600)
+                .frame(minWidth: 800, minHeight: 480)
                 .frame(idealWidth: 1280, idealHeight: 800)
         } defaultValue: {
             UUID()

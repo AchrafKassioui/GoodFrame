@@ -1,5 +1,5 @@
 /// The version shown in About Good Frame and in releases.
-MARKETING_VERSION = 1.1
+MARKETING_VERSION = 1.2
 
 /// Increase this for each distributed build of the same version.
 CURRENT_PROJECT_VERSION = 1

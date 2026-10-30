@@ -24,4 +24,14 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 
 ## Change Log
 
-- 1.1: review windows are opened centered on the app window that started the export.
+### 1.2
+
+- Step through videos frame by frame.
+- Export the current video frame as PNG or JPEG, with HDR support.
+- Copy images directly from the export window.
+- Drag exported files using the proxy icon (title bar file icon).
+- UI Improvements and new keyboard shortcuts.
+
+### 1.1
+
+- Export windows open centered over the app window that started the export.
