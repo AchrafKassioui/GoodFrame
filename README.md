@@ -7,7 +7,7 @@
 
 Good Frame is a **Mac app** for **cropping** and **encoding** videos and images with **precision**.
 
-<img src="media/good-frame-screenshot.png" alt="video-crop-screenshot" style="width:100%;" />
+<img src="media/good-frame-screenshot.png" alt="good-frame-screenshot" style="width:100%;" />
 
 ## Install
 
