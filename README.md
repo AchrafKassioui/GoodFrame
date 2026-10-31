@@ -24,6 +24,10 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 
 ## Change Log
 
+### 1.3
+
+- Paste video or image into an empty app window.
+
 ### 1.2
 
 - Step through videos frame by frame.

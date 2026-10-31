@@ -6,7 +6,7 @@
  
  Achraf Kassioui
  Created 20 Oct 2026
- Updated 29 Oct 2026
+ Updated 31 Oct 2026
  
  */
 @preconcurrency import AVFoundation
@@ -326,6 +326,7 @@ struct EditorView: View {
     let windowIdentity: UUID
     init(windowIdentity: UUID = UUID()) { self.windowIdentity = windowIdentity }
     @State private var sourceURL: URL?
+    @State private var pastedMediaFile: PastedMediaFile?
     @State private var player: AVPlayer?
     @State private var playback = PlaybackState()
     @State private var imageSource: ImageSource?
@@ -432,6 +433,8 @@ struct EditorView: View {
                 preview: { previewOnly.toggle() }, inspector: toggleInspector,
                 step: requestZoomStep, actualSize: requestActualSize, fitVideo: requestFit)
             .frame(width: 0, height: 0)
+            EditorPaste(enabled: !loaded && !busy, paste: pasteMedia)
+                .frame(width: 0, height: 0)
         }
         .focusedSceneValue(\.cropHistory, history)
         .focusedSceneValue(\.cropPlayback, loaded && !isImage && !busy ? playback : nil)
@@ -529,6 +532,17 @@ struct EditorView: View {
         return true
     }
     
+    /// Open clipboard media only when this editor is empty.
+    private func pasteMedia() {
+        guard !loaded && !busy else { return }
+        do {
+            guard let media = try MediaClipboard.read(.general) else { return }
+            loadMedia(media.url, pastedFile: media.file)
+        } catch {
+            openError = error.localizedDescription
+        }
+    }
+    
     /// Choose an image or video to crop.
     private func openMedia() {
         let panel = NSOpenPanel()
@@ -557,6 +571,8 @@ struct EditorView: View {
         player = nil
         imageSource = nil
         sourceURL = nil
+        pastedMediaFile?.remove()
+        pastedMediaFile = nil
         sourceSize = .zero
         sourceMbps = 0
         sourceFPS = 0
@@ -572,7 +588,7 @@ struct EditorView: View {
     }
     
     /// Open the file, read its size, and show the inspector.
-    private func loadMedia(_ selectedURL: URL) {
+    private func loadMedia(_ selectedURL: URL, pastedFile: PastedMediaFile? = nil) {
         exportState.progress = nil
         busy = true
         Task { @MainActor in
@@ -587,6 +603,10 @@ struct EditorView: View {
                     player = nil
                     imageSource = source
                     sourceURL = selectedURL
+                    if pastedMediaFile?.url != selectedURL {
+                        pastedMediaFile?.remove()
+                        pastedMediaFile = pastedFile
+                    }
                     showInspector = true
                     sourceSize = CGSize(width: source.image.width, height: source.image.height)
                     sourceBytes = source.bytes
@@ -621,6 +641,10 @@ struct EditorView: View {
                 sourceMbps = Double(dataRate) / 1_000_000
                 sourceFPS = Double(frameRate)
                 sourceURL = selectedURL
+                if pastedMediaFile?.url != selectedURL {
+                    pastedMediaFile?.remove()
+                    pastedMediaFile = pastedFile
+                }
                 showInspector = true
                 player?.pause()
                 let openedPlayer = AVPlayer(url: selectedURL)
@@ -635,6 +659,7 @@ struct EditorView: View {
                 previewOnly = false
                 exportState.message = nil
             } catch {
+                pastedFile?.remove()
                 openError = error.localizedDescription
             }
         }
@@ -821,6 +846,121 @@ struct EmptyCanvasView: View {
 }
 
 // MARK: Editor Controls
+
+/// Read a copied image or video, preferring its original file when available.
+@MainActor
+enum MediaClipboard {
+    private static var fileOptions: [NSPasteboard.ReadingOptionKey: Any] {
+        [.urlReadingFileURLsOnly: true,
+         .urlReadingContentsConformToTypes: ImageSource.supportedTypes.map(\.identifier) + [UTType.movie.identifier, UTType.video.identifier]]
+    }
+    
+    private static func mediaType(in pasteboard: NSPasteboard) -> NSPasteboard.PasteboardType? {
+        pasteboard.types?.first { item in
+            guard let type = UTType(item.rawValue) else { return false }
+            return type.conforms(to: .movie) || type.conforms(to: .video)
+            || ImageSource.supportedTypes.contains(where: { type.conforms(to: $0) })
+        }
+    }
+    
+    static func canRead(_ pasteboard: NSPasteboard) -> Bool {
+        pasteboard.canReadObject(forClasses: [NSURL.self], options: fileOptions) || mediaType(in: pasteboard) != nil
+    }
+    
+    static func read(_ pasteboard: NSPasteboard) throws -> (url: URL, file: PastedMediaFile?)? {
+        if let url = (pasteboard.readObjects(forClasses: [NSURL.self], options: fileOptions) as? [URL])?.first {
+            return (url, nil)
+        }
+        guard let itemType = mediaType(in: pasteboard), let type = UTType(itemType.rawValue),
+              let data = pasteboard.data(forType: itemType) else { return nil }
+        let file = try PastedMediaFile(data: data, type: type)
+        return (file.url, file)
+    }
+}
+
+/// Keep clipboard media available until its editor closes the file.
+final class PastedMediaFile {
+    let url: URL
+    private let directory: URL
+    
+    init(data: Data, type: UTType) throws {
+        directory = ExportTemporaryStorage.shared.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let name = type.conforms(to: .image) ? "Pasted Image" : "Pasted Video"
+        url = directory.appendingPathComponent(name).appendingPathExtension(type.preferredFilenameExtension ?? "mov")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+    
+    func remove() { try? FileManager.default.removeItem(at: directory) }
+    
+    deinit { try? FileManager.default.removeItem(at: directory) }
+}
+
+/// Add media Paste to the window's normal command handling.
+struct EditorPaste: NSViewRepresentable {
+    let enabled: Bool
+    let paste: () -> Void
+    
+    func makeNSView(context: Context) -> EditorPasteView { EditorPasteView() }
+    
+    func updateNSView(_ view: EditorPasteView, context: Context) {
+        view.responder.enabled = enabled
+        view.responder.onPaste = paste
+    }
+    
+    static func dismantleNSView(_ view: EditorPasteView, coordinator: ()) {
+        view.responder.onPaste = nil
+        view.detach()
+    }
+}
+
+final class EditorPasteView: NSView {
+    let responder = MediaPasteResponder()
+    private weak var attachedWindow: NSWindow?
+    
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        detach()
+        guard let window else { return }
+        responder.nextResponder = window.nextResponder
+        window.nextResponder = responder
+        attachedWindow = window
+    }
+    
+    /// Remove this editor's Paste handler when its view leaves the window.
+    func detach() {
+        var previous: NSResponder? = attachedWindow
+        while let current = previous, let next = current.nextResponder {
+            if next === responder {
+                current.nextResponder = responder.nextResponder
+                break
+            }
+            previous = next
+        }
+        responder.nextResponder = nil
+        attachedWindow = nil
+    }
+}
+
+/// Text fields handle Paste first. Media Paste is available only in an empty editor.
+final class MediaPasteResponder: NSResponder, NSUserInterfaceValidations {
+    var enabled = false
+    var onPaste: (() -> Void)?
+    
+    @objc func paste(_ sender: Any?) {
+        guard enabled, MediaClipboard.canRead(.general) else { return }
+        onPaste?()
+    }
+    
+    func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        item.action == #selector(paste(_:)) && enabled && MediaClipboard.canRead(.general)
+    }
+}
 
 /// The zoom slider, plus and minus buttons, percentage, and Fit button.
 struct ZoomControls: View {

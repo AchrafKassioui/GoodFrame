@@ -4,7 +4,7 @@
  
  Achraf Kassioui
  Created 19 Oct 2026
- Updated 30 Oct 2026
+ Updated 31 Oct 2026
  
  */
 import SwiftUI
@@ -25,6 +25,11 @@ struct GoodFrameApp: App {
         .commands {
             CropHistoryCommands()
             CropWindowCommands()
+            /// Open the app website from the Help menu.
+            CommandGroup(replacing: .help) {
+                Link("Good Frame Website", destination: URL(string: "https://www.achrafkassioui.com/good-frame")!)
+                    .keyboardShortcut("?", modifiers: .command)
+            }
         }
     }
 }
