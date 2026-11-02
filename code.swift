@@ -6,7 +6,7 @@
  
  Achraf Kassioui
  Created 20 Oct 2026
- Updated 31 Oct 2026
+ Updated 2 Nov 2026
  
  */
 @preconcurrency import AVFoundation
@@ -366,8 +366,8 @@ struct EditorView: View {
     private var outputHeight: Int { Int(sourceSize.height) - crop.top - crop.bottom }
     private var validCrop: Bool {
         let minimum = history.pixelStep
-        return [crop.left, crop.top, crop.right, crop.bottom].allSatisfy { $0 >= 0 }
-        && outputWidth >= minimum && outputHeight >= minimum
+        return outputWidth >= minimum && outputHeight >= minimum
+        && outputWidth <= CropMargins.maximumDimension && outputHeight <= CropMargins.maximumDimension
         && (isImage || (outputWidth.isMultiple(of: 2) && outputHeight.isMultiple(of: 2)))
     }
     
@@ -381,7 +381,7 @@ struct EditorView: View {
                 CropCanvas(
                     player: player, image: imageSource?.image, sourceSize: sourceSize, crop: cropBinding, zoom: $zoom, fit: $fit,
                     previewOnly: previewOnly, cameraRequest: cameraRequest, centerCameraOnRequest: centerCameraOnRequest, framingInsets: player == nil ? NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20) : layout.framingInsets,
-                    history: history, playback: !busy && !isImage ? playback : nil, windowIdentity: windowIdentity, canvasColor: loaded ? NSColor(canvasColor) : .windowBackgroundColor, onFit: requestFit,
+                    history: history, playback: !busy && !isImage ? playback : nil, windowIdentity: windowIdentity, canvasColor: loaded ? NSColor(canvasColor) : .windowBackgroundColor, exportFill: (isImage || history.exportsFrame) && history.imageEncoding.format == .png ? nil : NSColor(history.imageEncoding.background.color), onFit: requestFit,
                     onExitPreview: { previewOnly = false }
                 )
                 .frame(width: geometry.size.width, height: geometry.size.height)
@@ -745,6 +745,7 @@ struct EditorView: View {
         }
         let selectedCrop = crop.rectangle(in: sourceSize)
         let selectedSettings = settings
+        let selectedFill = history.imageEncoding.background
         previewOnly = false
         withAnimation { showInspector = true }
         player?.pause()
@@ -767,7 +768,7 @@ struct EditorView: View {
             do {
                 let started = Date()
                 try await VideoExporter.export(
-                    source: sourceURL, destination: destinationURL, crop: selectedCrop, settings: selectedSettings,
+                    source: sourceURL, destination: destinationURL, crop: selectedCrop, settings: selectedSettings, fill: selectedFill,
                     fileSize: { bytes in Task { @MainActor in if exportState.operation == operation { exportState.bytes = bytes } } },
                     progress: { value in Task { @MainActor in if exportState.operation == operation { exportState.progress = value } } })
                 try Task.checkCancellation()
@@ -1281,12 +1282,12 @@ struct InspectorView: View {
                     }
                     .disabled(!loaded || busy)
                     if let imageSource {
-                        ImageEncodingSection(history: history, hasTransparency: imageSource.hasTransparency)
+                        ImageEncodingSection(history: history, hasTransparency: imageSource.hasTransparency || crop.addsPadding)
                             .disabled(busy)
                     } else {
                         CropEncodingSection(
                             history: history, originalBitrate: originalBitrate, sourceMbps: sourceMbps,
-                            loaded: loaded, busy: busy, isHDR: sourceIsHDR, hasTransparency: videoHasTransparency)
+                            loaded: loaded, busy: busy, isHDR: sourceIsHDR, hasTransparency: videoHasTransparency || crop.addsPadding)
                     }
                     CropCanvasSection(color: $canvasColor)
                 }
@@ -1307,10 +1308,10 @@ struct InspectorView: View {
     /// A crop margin field and its stepper.
     private func marginField(_ title: String, edge: CropMargins.Edge) -> some View {
         let value = Binding<Int>(
-            get: { crop[edge] },
+            get: { -crop[edge] },
             set: { requested in
                 var updated = crop
-                updated.set(edge, to: requested, in: sourceSize, multiple: history.pixelStep)
+                updated.set(edge, to: CropMargins.inset(for: requested), in: sourceSize, multiple: history.pixelStep)
                 cropBinding.wrappedValue = updated
             })
         
@@ -1339,7 +1340,7 @@ struct InspectorView: View {
         
         return HStack(spacing: 4) {
             CropDimensionField(
-                value: value, maximum: Int(horizontal ? sourceSize.width : sourceSize.height), label: title, history: history, showsPlaceholder: !loaded
+                value: value, maximum: CropMargins.maximumDimension, label: title, history: history, showsPlaceholder: !loaded
             )
             .frame(height: 22)
             pixelStepper(value, title: title)
@@ -1465,6 +1466,7 @@ struct CropEncodingSection: View {
                 )
                 .accessibilityLabel("Video bitrate in Mbps")
                 .help("Higher bitrate preserves more detail and produces larger files.")
+                if hasTransparency { ExportFillControls(history: history) }
             }
         }
         .disabled(!loaded || busy)
@@ -1993,6 +1995,9 @@ struct CropNumberField: NSViewRepresentable {
     let history: EditHistory
     var showsPlaceholder = false
     
+    /// Show the direction of each edge adjustment.
+    static func displayValue(_ value: Int) -> String { value > 0 ? "+\(value)" : String(value) }
+    
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     
     func makeNSView(context: Context) -> SelectingNumberField {
@@ -2011,7 +2016,7 @@ struct CropNumberField: NSViewRepresentable {
         context.coordinator.parent = self
         field.isEnabled = context.environment.isEnabled
         field.placeholderString = "—"
-        if field.currentEditor() == nil { field.stringValue = showsPlaceholder ? "" : String(value) }
+        if field.currentEditor() == nil { field.stringValue = showsPlaceholder ? "" : Self.displayValue(value) }
     }
     
     @MainActor
@@ -2041,7 +2046,7 @@ struct CropNumberField: NSViewRepresentable {
         func controlTextDidEndEditing(_ notification: Notification) {
             if let field = notification.object as? NSTextField {
                 if let number = Int(field.stringValue) { parent.value = number }
-                field.stringValue = String(parent.value)
+                field.stringValue = CropNumberField.displayValue(parent.value)
                 if let editor = field.window?.fieldEditor(false, for: field) as? NSTextView { editor.allowsUndo = true }
             }
             parent.history.end()
@@ -2054,7 +2059,7 @@ struct CropNumberField: NSViewRepresentable {
             let shifted = command.contains("AndModifySelection") || NSApp.currentEvent?.modifierFlags.contains(.shift) == true
             let step = shifted ? 10 : parent.history.pixelStep
             parent.value += command.hasPrefix("moveUp") ? step : -step
-            control.stringValue = String(parent.value)
+            control.stringValue = CropNumberField.displayValue(parent.value)
             textView.string = control.stringValue
             textView.selectAll(nil)
             return true
@@ -2088,8 +2093,16 @@ class SelectingNumberField: NSTextField {
 
 // MARK: Crop Geometry
 
-/// How many pixels to remove from each side of the video.
+/// Crop inside the original, or add space around it.
 struct CropMargins: Equatable {
+    /// Limit export dimensions before allocating image or video buffers.
+    static let maximumDimension = 16_384
+    /// Positive field values add space. Crop calculations use inward margins.
+    static func inset(for adjustment: Int) -> Int {
+        -min(max(adjustment, -maximumDimension), maximumDimension)
+    }
+    var addsPadding: Bool { [left, top, right, bottom].contains { $0 < 0 } }
+    
     enum Edge: CaseIterable { case left, top, right, bottom }
     var left = 0
     var top = 0
@@ -2124,7 +2137,7 @@ struct CropMargins: Equatable {
         CGRect(x: left, y: top, width: max(0, Int(size.width) - left - right), height: max(0, Int(size.height) - top - bottom))
     }
     
-    /// Keep the crop inside the image and use the pixel step required by its format.
+    /// Negative margins add space. Keep the output within the supported pixel dimensions.
     mutating func set(_ edge: Edge, to requested: Int, in size: CGSize, multiple: Int = 2) {
         let horizontal = edge == .left || edge == .right
         let opposite: Edge =
@@ -2135,27 +2148,28 @@ struct CropMargins: Equatable {
         case .bottom: .top
         }
         let extent = Int(horizontal ? size.width : size.height)
-        let maximum = max(0, extent - self[opposite] - multiple)
-        var margin = min(maximum, max(0, requested))
+        let maximum = extent - self[opposite] - multiple
+        let minimum = extent - self[opposite] - Self.maximumDimension
+        var margin = min(maximum, max(minimum, requested))
         if (extent - self[opposite] - margin) % multiple != 0 {
-            margin = margin < maximum ? margin + 1 : max(0, margin - 1)
+            margin = margin < maximum ? margin + 1 : margin - 1
         }
         self[edge] = margin
     }
     
-    /// Resize around the crop center and keep the crop inside the image or video.
+    /// Resize around the crop center, including space outside the original image or video.
     func resized(width: Int, height: Int, in size: CGSize, multiple: Int = 2, center: CGPoint? = nil) -> CropMargins {
-        let maximumWidth = max(multiple, Int(size.width) / multiple * multiple)
-        let maximumHeight = max(multiple, Int(size.height) / multiple * multiple)
+        let maximumWidth = Self.maximumDimension / multiple * multiple
+        let maximumHeight = Self.maximumDimension / multiple * multiple
         let retainedWidth = min(maximumWidth, max(multiple, width / multiple * multiple))
         let retainedHeight = min(maximumHeight, max(multiple, height / multiple * multiple))
         let current = rectangle(in: size)
         let center = center ?? CGPoint(x: current.midX, y: current.midY)
-        let left = min(max(0, Int((center.x - Double(retainedWidth) / 2).rounded())), max(0, Int(size.width) - retainedWidth))
-        let top = min(max(0, Int((center.y - Double(retainedHeight) / 2).rounded())), max(0, Int(size.height) - retainedHeight))
+        let left = Int((center.x - Double(retainedWidth) / 2).rounded())
+        let top = Int((center.y - Double(retainedHeight) / 2).rounded())
         return CropMargins(
-            left: left, top: top, right: max(0, Int(size.width) - left - retainedWidth),
-            bottom: max(0, Int(size.height) - top - retainedHeight))
+            left: left, top: top, right: Int(size.width) - left - retainedWidth,
+            bottom: Int(size.height) - top - retainedHeight)
     }
     
     /// Keep the starting crop ratio while dragging a corner. The opposite corner stays in place.
@@ -2166,8 +2180,8 @@ struct CropMargins: Equatable {
         let movesTop = edges.contains(.top)
         let anchorX = movesLeft ? rectangle.maxX : rectangle.minX
         let anchorY = movesTop ? rectangle.maxY : rectangle.minY
-        let availableWidth = movesLeft ? anchorX : size.width - anchorX
-        let availableHeight = movesTop ? anchorY : size.height - anchorY
+        let availableWidth = CGFloat(Self.maximumDimension)
+        let availableHeight = CGFloat(Self.maximumDimension)
         let requestedWidth = rectangle.width + (movesLeft ? -horizontal : horizontal)
         let requestedHeight = rectangle.height + (movesTop ? -vertical : vertical)
         let requestedScale = (requestedWidth * rectangle.width + requestedHeight * rectangle.height)
@@ -2186,10 +2200,8 @@ struct CropMargins: Equatable {
         return CropMargins(left: left, top: top, right: Int(size.width) - left - width, bottom: Int(size.height) - top - height)
     }
     
-    /// Move the crop rectangle without changing its size or letting it leave the video.
+    /// Move the framing rectangle without changing its size.
     func translated(horizontal: Int, vertical: Int) -> CropMargins {
-        let horizontal = min(right, max(-left, horizontal))
-        let vertical = min(bottom, max(-top, vertical))
         return CropMargins(left: left + horizontal, top: top + vertical, right: right - horizontal, bottom: bottom - vertical)
     }
 }
@@ -2890,6 +2902,7 @@ struct CropCanvas: NSViewRepresentable {
     let playback: PlaybackState?
     let windowIdentity: UUID
     let canvasColor: NSColor
+    let exportFill: NSColor?
     let onFit: () -> Void
     let onExitPreview: () -> Void
     
@@ -2901,6 +2914,7 @@ struct CropCanvas: NSViewRepresentable {
     
     func updateNSView(_ view: CanvasScrollView, context: Context) {
         view.backgroundColor = canvasColor
+        view.exportFill = exportFill
         view.onZoom = { value, fitted in
             zoom = value
             fit = fitted
@@ -2920,9 +2934,13 @@ final class CanvasScrollView: NSScrollView {
     
     var windowIdentity: UUID?
     private let canvas = VideoCanvasView()
+    var exportFill: NSColor? {
+        didSet { canvas.exportFill = exportFill }
+    }
     private var sourceSize = CGSize.zero
     private var zoom = 1.0
     private var fit = true
+    private var fitBounds = CGRect.zero
     private var previewOnly = false
     private var layingOut = false
     private var eventMonitor: Any?
@@ -2980,6 +2998,7 @@ final class CanvasScrollView: NSScrollView {
         self.request = request
         self.insets = insets
         sourceSize = size
+        if newSource || animate { fitBounds = CGRect(origin: .zero, size: size).union(crop.rectangle(in: size)) }
         self.zoom = zoom
         self.fit = fit
         if !fit || newSource { publishedZoom = -1 }
@@ -3000,7 +3019,7 @@ final class CanvasScrollView: NSScrollView {
         if newSource || (changedScale && !animate) { stopAnimation() }
         if animate {
             animateCamera(centerSource: centerCameraOnRequest)
-        } else if changedScale || newSource || changedPreview || (previewOnly && changedCrop) {
+        } else if changedScale || newSource || changedPreview || changedCrop {
             layoutCanvas(centerSource: newSource)
         }
         if changedCrop || newSource || changedScale || changedPreview {
@@ -3127,7 +3146,7 @@ final class CanvasScrollView: NSScrollView {
     }
     
     private var framing: CGRect {
-        CGRect(origin: .zero, size: sourceSize)
+        CGRect(origin: .zero, size: sourceSize).union(canvas.overlay.crop.rectangle(in: sourceSize))
     }
     
     private var anchor: CGPoint {
@@ -3138,8 +3157,8 @@ final class CanvasScrollView: NSScrollView {
     
     private var fittedScale: CGFloat {
         min(
-            max(1, contentView.bounds.width - insets.left - insets.right - 240) / max(1, framing.width),
-            max(1, contentView.bounds.height - insets.top - insets.bottom - 192) / max(1, framing.height))
+            max(1, contentView.bounds.width - insets.left - insets.right - 240) / max(1, fitBounds.width),
+            max(1, contentView.bounds.height - insets.top - insets.bottom - 192) / max(1, fitBounds.height))
     }
     
     /// Size and position the video on the canvas.
@@ -3343,6 +3362,15 @@ final class VideoCanvasView: NSView {
     }
     let overlay = CropOverlayView()
     private let videoSurface = NSView()
+    private let fillLayer = CALayer()
+    var exportFill: NSColor? {
+        didSet {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            fillLayer.backgroundColor = exportFill?.cgColor
+            CATransaction.commit()
+        }
+    }
     private let cropMask = CALayer()
     private let retainedMask = CALayer()
     private var displayedPreview = false
@@ -3352,6 +3380,8 @@ final class VideoCanvasView: NSView {
     
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.addSublayer(fillLayer)
         videoSurface.wantsLayer = true
         videoLayer.videoGravity = .resize
         videoSurface.layer?.addSublayer(mediaLayer)
@@ -3374,6 +3404,8 @@ final class VideoCanvasView: NSView {
     func positionVideo(in imageFrame: CGRect, retained: CGRect, scale: CGFloat) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        /// Show the export background inside the framing rectangle.
+        fillLayer.frame = CGRect(x: imageFrame.minX + retained.minX * scale, y: imageFrame.minY + retained.minY * scale, width: retained.width * scale, height: retained.height * scale)
         videoSurface.frame = imageFrame
         mediaLayer.frame = videoSurface.bounds
         videoLayer.frame = mediaLayer.bounds
@@ -3539,11 +3571,11 @@ final class CropOverlayView: NSView {
         for edge in CropMargins.Edge.allCases {
             let title = String(describing: edge).capitalized
             let value = Binding<Int>(
-                get: { [weak self] in self?.crop[edge] ?? 0 },
+                get: { [weak self] in -(self?.crop[edge] ?? 0) },
                 set: { [weak self] value in
                     guard let self else { return }
                     var updated = self.crop
-                    updated.set(edge, to: value, in: self.sourceSize, multiple: history.pixelStep)
+                    updated.set(edge, to: CropMargins.inset(for: value), in: self.sourceSize, multiple: history.pixelStep)
                     self.crop = updated
                     self.onChange?(updated)
                     self.updateFields()
@@ -3738,7 +3770,7 @@ struct ImageEncodingSettings: Equatable, Sendable {
     var background = ImageBackground()
 }
 
-/// Fill transparent areas with this color when exporting JPEG.
+/// Fill color for JPEG and video exports.
 struct ImageBackground: Equatable, Sendable {
     var red = 1.0
     var green = 1.0
@@ -3824,7 +3856,7 @@ enum ImageError: LocalizedError {
         case .unsupported: "Open a PNG, JPEG, HEIC, or TIFF image."
         case .multipleImages: "Animated images and images with multiple pages are not supported."
         case .unreadable: "This image could not be read."
-        case .invalidCrop: "The crop must stay inside the image and contain at least one pixel."
+        case .invalidCrop: "Choose output dimensions between 1 and 16384 pixels."
         case .encodingFailed: "The cropped image could not be exported."
         case .unreadableFrame: "This video frame could not be read."
         }
@@ -3838,8 +3870,21 @@ enum ImageExporter {
     static func export(source: ImageSource, destination: URL, crop: CGRect, settings: ImageEncodingSettings) throws {
         try Task.checkCancellation()
         let bounds = CGRect(x: 0, y: 0, width: source.image.width, height: source.image.height)
-        guard crop.width >= 1, crop.height >= 1, crop == crop.integral, bounds.contains(crop),
-              let cropped = source.image.cropping(to: crop) else { throw ImageError.invalidCrop }
+        guard crop.width >= 1, crop.height >= 1, crop == crop.integral,
+              crop.width <= CGFloat(CropMargins.maximumDimension), crop.height <= CGFloat(CropMargins.maximumDimension) else { throw ImageError.invalidCrop }
+        let cropped: CGImage
+        if bounds.contains(crop), let image = source.image.cropping(to: crop) {
+            cropped = image
+        } else {
+            /// Place the original pixels inside a larger transparent image.
+            let outputBounds = CGRect(origin: .zero, size: crop.size)
+            let original = CIImage(cgImage: source.image).transformed(by: CGAffineTransform(translationX: -crop.minX, y: crop.maxY - bounds.height))
+            let clear = CIImage(color: .clear).cropped(to: outputBounds)
+            let padded = original.composited(over: clear).cropped(to: outputBounds)
+            let format: CIFormat = source.isHDR ? .RGBAh : (source.image.bitsPerComponent > 8 ? .RGBA16 : .RGBA8)
+            guard let image = imageContext.createCGImage(padded, from: outputBounds, format: format, colorSpace: source.image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!) else { throw ImageError.encodingFailed }
+            cropped = image
+        }
         guard let destination = CGImageDestinationCreateWithURL(destination as CFURL, settings.format.contentType.identifier as CFString, 1, nil) else {
             throw ImageError.encodingFailed
         }
@@ -3851,7 +3896,7 @@ enum ImageExporter {
         }
         if settings.format == .jpeg {
             properties[kCGImageDestinationLossyCompressionQuality] = min(1, max(0, settings.quality))
-            if source.hasTransparency {
+            if source.hasTransparency || !bounds.contains(crop) {
                 /// JPEG fills transparent pixels with the selected color.
                 let background = CGColor(colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!, components: [settings.background.red, settings.background.green, settings.background.blue, 1])!
                 properties[kCGImageDestinationBackgroundColor] = background
@@ -3919,18 +3964,27 @@ struct ImageQualityControls: View {
             .accessibilityLabel("JPEG quality")
             .help("Higher quality produces larger files")
             if hasTransparency {
-                HStack(alignment: .center) {
-                    Text("Fill Color")
-                    Spacer()
-                    ColorPicker("Fill Color", selection: Binding(
-                        get: { history.imageEncoding.background.color },
-                        set: { history.imageEncoding.background = ImageBackground($0) }), supportsOpacity: false)
-                    .labelsHidden()
-                    .fixedSize()
-                    .help("Fill transparent areas")
-                    CropResetButton("Reset JPEG Background") { history.imageEncoding.background = ImageBackground() }
-                }
+                ExportFillControls(history: history)
             }
+        }
+    }
+}
+
+/// Fill color used by JPEG and video exports.
+struct ExportFillControls: View {
+    @Bindable var history: EditHistory
+    
+    var body: some View {
+        HStack(alignment: .center) {
+            Text("Fill Color")
+            Spacer()
+            ColorPicker("Fill Color", selection: Binding(
+                get: { history.imageEncoding.background.color },
+                set: { history.imageEncoding.background = ImageBackground($0) }), supportsOpacity: false)
+            .labelsHidden()
+            .fixedSize()
+            .help("Fill transparent areas")
+            CropResetButton("Reset Fill Color") { history.imageEncoding.background = ImageBackground() }
         }
     }
 }
@@ -4017,15 +4071,16 @@ enum VideoExporter {
     
     /// Export the selected crop with the chosen codec and bitrate.
     static func export(
-        source: URL, destination: URL, crop: CGRect, settings: EncodingSettings, fileSize: @escaping @Sendable (Int64) -> Void = { _ in },
+        source: URL, destination: URL, crop: CGRect, settings: EncodingSettings, fill: ImageBackground = ImageBackground(), fileSize: @escaping @Sendable (Int64) -> Void = { _ in },
         progress: @escaping @Sendable (Double) -> Void = { _ in }
     ) async throws {
         let asset = AVURLAsset(url: source)
         let geometry = try await geometry(for: asset)
-        guard geometry.bounds.contains(crop), crop.width >= 2, crop.height >= 2,
+        guard crop == crop.integral, crop.width >= 2, crop.height >= 2,
+              crop.width <= CGFloat(CropMargins.maximumDimension), crop.height <= CGFloat(CropMargins.maximumDimension),
               Int(crop.width).isMultiple(of: 2), Int(crop.height).isMultiple(of: 2)
                 else {
-            throw failure("The crop must fit inside the video and have even dimensions of at least two pixels.")
+            throw failure("Choose even output dimensions between 2 and 16384 pixels.")
         }
         let color = try await colorInfo(for: geometry.track)
         guard !color.isHDR || settings.codec == .hevc else {
@@ -4038,6 +4093,8 @@ enum VideoExporter {
         let cropTransform = geometry.transform.concatenating(CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
         layer.setTransform(cropTransform, at: .zero)
         instruction.layerInstructions = [layer]
+        /// Fill the space around the video with the chosen export color.
+        instruction.backgroundColor = NSColor(fill.color).cgColor
         
         /// Use the original frame rate and colors when rendering the crop.
         let composition = try await AVMutableVideoComposition.videoComposition(withPropertiesOf: asset)

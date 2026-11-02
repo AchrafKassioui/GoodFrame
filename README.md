@@ -24,6 +24,10 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 
 ## Change Log
 
+### 1.4
+
+- Extend the frame of videos and images to add space around them.
+
 ### 1.3
 
 - Paste video or image into an empty app window.
