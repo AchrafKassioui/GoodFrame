@@ -5,7 +5,7 @@
 
 # Good Frame
 
-Good Frame is a **Mac app** for **cropping** and **encoding** videos and images with **precision**.
+Good Frame is a **Mac app** for cropping, resizing, speeding, and encoding videos and images with **precision**.
 
 <img src="media/good-frame-screenshot.png" alt="good-frame-screenshot" style="width:100%;" />
 
@@ -23,6 +23,14 @@ Requires macOS 15.6 or later.
 Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-frame).
 
 ## Change Log
+
+### 1.5
+
+- Speed up parts of a video. Split the timeline at any frame and set each section's speed. Audio keeps its pitch.
+- Set the output size in pixels, maintaining the crop proportions.
+- Export videos as MP4 or MOV.
+- New Speed menu. Play and pause with Space.
+- Confirmation before quitting during an export.
 
 ### 1.4
 
