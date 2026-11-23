@@ -23,6 +23,11 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 
 ## Change Log
 
+### 1.6
+
+- Improved UI for speed change.
+- Loop playback (⌥⌘L).
+
 ### 1.5
 
 - Speed up parts of a video. Split the timeline at any frame and set each section's speed. Audio keeps its pitch.
