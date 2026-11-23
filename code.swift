@@ -392,7 +392,7 @@ struct EditorView: View {
                         .frame(width: geometry.size.width, height: geometry.size.height)
                 }
                 if player != nil {
-                    PlaybackControls(playback: playback)
+                    PlaybackControls(playback: playback, history: history)
                         .disabled(busy)
                         .cropPanel()
                         .frame(width: layout.playbackWidth)
@@ -404,12 +404,14 @@ struct EditorView: View {
                         .position(layout.playbackCenter)
                 }
             }
+            /// Preview playback follows the export speeds.
+            .onChange(of: history.speeds, initial: true) { playback.speeds = history.speeds }
         }
         .inspector(isPresented: Binding(get: { loaded && showInspector }, set: { showInspector = $0 })) {
             InspectorView(
                 history: history, imageSource: imageSource, sourceSize: sourceSize, sourceMbps: sourceMbps,
                 sourceFPS: sourceFPS, sourceBytes: sourceBytes, sourceIsHDR: sourceIsHDR, duration: duration, videoHasTransparency: videoHasTransparency,
-                loaded: loaded, busy: busy, canvasColor: $canvasColor,
+                loaded: loaded, busy: busy, canvasColor: $canvasColor, playback: player == nil ? nil : playback,
                 exportState: exportState, canExport: canExport, export: exportMedia,
                 cancel: { exportTask?.cancel() }
             )
@@ -746,6 +748,9 @@ struct EditorView: View {
         let selectedCrop = crop.rectangle(in: sourceSize)
         let selectedSettings = settings
         let selectedFill = history.imageEncoding.background
+        let selectedSections = history.speeds.sections(
+            times: playback.frames.times, duration: CMTime(seconds: duration, preferredTimescale: 600))
+        let outputSize = selectedSettings.outputSize(for: selectedCrop.size)
         previewOnly = false
         withAnimation { showInspector = true }
         player?.pause()
@@ -756,7 +761,8 @@ struct EditorView: View {
         exportState.progress = 0
         exportState.message = nil
         exportTask = Task { @MainActor in
-            let destinationURL = ExportTemporaryStorage.shared.directory.appendingPathComponent("GoodFrame-\(UUID().uuidString).mov")
+            let destinationURL = ExportTemporaryStorage.shared.directory
+                .appendingPathComponent("GoodFrame-\(UUID().uuidString)").appendingPathExtension(selectedSettings.container.fileExtension)
             var handedOff = false
             defer {
                 if !handedOff { try? FileManager.default.removeItem(at: destinationURL) }
@@ -768,17 +774,18 @@ struct EditorView: View {
             do {
                 let started = Date()
                 try await VideoExporter.export(
-                    source: sourceURL, destination: destinationURL, crop: selectedCrop, settings: selectedSettings, fill: selectedFill,
+                    source: sourceURL, destination: destinationURL, crop: selectedCrop, settings: selectedSettings, speedSections: selectedSections, fill: selectedFill,
                     fileSize: { bytes in Task { @MainActor in if exportState.operation == operation { exportState.bytes = bytes } } },
                     progress: { value in Task { @MainActor in if exportState.operation == operation { exportState.progress = value } } })
                 try Task.checkCancellation()
                 let attributes = try FileManager.default.attributesOfItem(atPath: destinationURL.path)
                 let bytes = (attributes[.size] as? NSNumber)?.int64Value ?? 0
                 let summary = ExportSummary(
-                    codec: selectedSettings.codec.rawValue, bitrate: selectedSettings.megabitsPerSecond,
-                    bytes: bytes, elapsed: Date().timeIntervalSince(started), isHDR: sourceIsHDR, resolution: selectedCrop.size)
+                    codec: "\(selectedSettings.codec.rawValue) \(selectedSettings.container.rawValue)", bitrate: selectedSettings.megabitsPerSecond,
+                    bytes: bytes, elapsed: Date().timeIntervalSince(started), isHDR: sourceIsHDR, resolution: outputSize)
                 let document = try ExportDocument(
-                    exportURL: destinationURL, title: sourceURL.deletingPathExtension().lastPathComponent + "-framed", summary: summary, parentWindow: exportWindow)
+                    exportURL: destinationURL, title: sourceURL.deletingPathExtension().lastPathComponent + "-framed", summary: summary,
+                    contentType: selectedSettings.container.contentType, parentWindow: exportWindow)
                 NSDocumentController.shared.addDocument(document)
                 document.makeWindowControllers()
                 document.showWindows()
@@ -1206,6 +1213,7 @@ struct InspectorView: View {
     let loaded: Bool
     let busy: Bool
     @Binding var canvasColor: Color
+    let playback: PlaybackState?
     let exportState: CropExportState
     let canExport: Bool
     let export: () -> Void
@@ -1215,6 +1223,11 @@ struct InspectorView: View {
     private var outputWidth: Int { Int(sourceSize.width) - crop.left - crop.right }
     private var outputHeight: Int { Int(sourceSize.height) - crop.top - crop.bottom }
     private var originalBitrate: Double { sourceMbps.isFinite && sourceMbps > 0 ? sourceMbps : 2.5 }
+    /// The exported video size: the crop, resized when an output width is set.
+    private var exportSize: CGSize {
+        guard imageSource == nil, !history.exportsFrame else { return CGSize(width: outputWidth, height: outputHeight) }
+        return history.value.encoding.outputSize(for: CGSize(width: outputWidth, height: outputHeight))
+    }
     
     /// Arrange the inspector controls in sections.
     var body: some View {
@@ -1287,7 +1300,12 @@ struct InspectorView: View {
                     } else {
                         CropEncodingSection(
                             history: history, originalBitrate: originalBitrate, sourceMbps: sourceMbps,
-                            loaded: loaded, busy: busy, isHDR: sourceIsHDR, hasTransparency: videoHasTransparency || crop.addsPadding)
+                            loaded: loaded, busy: busy, isHDR: sourceIsHDR, hasTransparency: videoHasTransparency || crop.addsPadding,
+                            cropSize: CGSize(width: outputWidth, height: outputHeight))
+                        if let playback, !history.exportsFrame {
+                            SpeedInspectorSection(history: history, playback: playback, duration: duration)
+                                .disabled(busy)
+                        }
                     }
                     CropCanvasSection(color: $canvasColor)
                 }
@@ -1298,7 +1316,7 @@ struct InspectorView: View {
                 .opacity(0.45)
             CropExportFooter(
                 state: exportState, canExport: canExport, loaded: loaded,
-                outputWidth: outputWidth, outputHeight: outputHeight,
+                outputWidth: Int(exportSize.width), outputHeight: Int(exportSize.height),
                 encodingName: imageSource == nil ? history.exportFormat.rawValue : history.imageEncoding.format.rawValue,
                 exportTitle: imageSource != nil ? "Export Image" : (history.exportsFrame ? "Export Current Frame" : "Export Video"),
                 export: export, cancel: cancel)
@@ -1441,6 +1459,8 @@ struct CropEncodingSection: View {
     let busy: Bool
     let isHDR: Bool
     let hasTransparency: Bool
+    let cropSize: CGSize
+    private var outputSize: CGSize { history.value.encoding.outputSize(for: cropSize) }
     
     var body: some View {
         CropInspectorSection("Encoding") {
@@ -1449,6 +1469,32 @@ struct CropEncodingSection: View {
                 Spacer()
                 CropFormatPicker(selection: $history.exportFormat, isHDR: isHDR)
                     .fixedSize()
+            }
+            if !history.exportsFrame {
+                HStack {
+                    Text("Container")
+                    Spacer()
+                    Picker("Container", selection: $history.container) {
+                        ForEach(VideoContainer.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                    .help("MP4 plays everywhere on the web. MOV keeps Apple metadata such as Retina sizing.")
+                }
+                /// The output keeps the crop's proportions: set one side, the other follows.
+                HStack(spacing: 6) {
+                    Text("Size")
+                    Spacer()
+                    CropDimensionField(value: outputSide(horizontal: true), maximum: CropMargins.maximumDimension, label: "Output width", history: history, showsPlaceholder: !loaded)
+                        .frame(width: 64, height: 22)
+                    Text("×")
+                        .foregroundStyle(.secondary)
+                    CropDimensionField(value: outputSide(horizontal: false), maximum: CropMargins.maximumDimension, label: "Output height", history: history, showsPlaceholder: !loaded)
+                        .frame(width: 64, height: 22)
+                    CropResetButton("Match Crop Size") { history.outputWidth = nil }
+                }
+                .help("Output size in pixels")
             }
             if history.exportsFrame {
                 ImageQualityControls(history: history, hasTransparency: hasTransparency)
@@ -1470,6 +1516,264 @@ struct CropEncodingSection: View {
             }
         }
         .disabled(!loaded || busy)
+    }
+    
+    /// A side of the output size. Setting either side sets the output width.
+    private func outputSide(horizontal: Bool) -> Binding<Int> {
+        Binding(
+            get: { Int(horizontal ? outputSize.width : outputSize.height) },
+            set: { requested in
+                guard cropSize.width > 0, cropSize.height > 0 else { return }
+                let width = horizontal ? requested : Int((Double(requested) * cropSize.width / cropSize.height / 2).rounded()) * 2
+                history.outputWidth = width == Int(cropSize.width) ? nil : max(2, width)
+            })
+    }
+}
+
+/// The speed of the section under the playhead. Keyframes are edited on the timeline.
+struct SpeedInspectorSection: View {
+    @Bindable var history: EditHistory
+    let playback: PlaybackState
+    let duration: Double
+    
+    private var frame: Int { playback.selectedFrame }
+    private var keyframes: [SpeedChange] { history.speeds.keyframes }
+    private var outputSeconds: Double {
+        keyframes.sections(times: playback.frames.times, duration: CMTime(seconds: duration, preferredTimescale: 600)).outputSeconds
+    }
+    /// The section under the playhead, in frames from 1.
+    private var section: (first: Int, last: Int) {
+        let first = keyframes.last(where: { $0.frame <= frame })?.frame ?? 0
+        let next = keyframes.first(where: { $0.frame > frame })?.frame ?? playback.frameCount
+        return (first + 1, max(first + 1, next))
+    }
+    private var canSplit: Bool { !keyframes.contains { $0.frame == frame } }
+    /// 1× until a section plays at another speed. Then the length before and after.
+    private var summary: String {
+        guard keyframes.contains(where: { $0.speed != 1 }) else { return "1×" }
+        return "\(duration.formatted(CropFormatting.seconds)) → \(outputSeconds.formatted(CropFormatting.seconds)) s"
+    }
+    
+    /// Like the Crop section: the title, then the summary and a reset on the same line.
+    /// The line keeps its height with or without changes, so nothing below moves.
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center) {
+                Text("Speed")
+                    .font(.headline)
+                Spacer()
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .help("Length before and after the speed changes")
+                CropResetButton("Remove All Speed Changes") { history.speeds = [] }
+                    .help("Remove all speed changes")
+                    .opacity(history.speeds.isEdited ? 1 : 0)
+                    .disabled(!history.speeds.isEdited)
+            }
+            /// The menu changes the section under the playhead. The label says which one.
+            HStack(spacing: 8) {
+                Text("Frames \(section.first)–\(section.last)")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .help("The section under the playhead")
+                Spacer()
+                Button("Split at Current Frame", systemImage: "scissors") { history.speeds = keyframes.splitting(at: frame) }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .disabled(!canSplit)
+                    .help("Split at current frame")
+                Picker("Section speed", selection: speedBinding) {
+                    ForEach(SpeedChange.steps, id: \.self) { Text(Self.label($0)).tag($0) }
+                }
+                .labelsHidden()
+                .fixedSize()
+                .help("Speed of this section")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    
+    private var speedBinding: Binding<Double> {
+        Binding(
+            get: { keyframes.speed(at: frame) },
+            set: { history.speeds = keyframes.settingSpeed($0, forSectionAt: frame) })
+    }
+    
+    static func label(_ speed: Double) -> String {
+        "\(speed.formatted(.number.precision(.fractionLength(0...1)).locale(CropFormatting.locale)))×"
+    }
+}
+
+/// Speed keyframes under the timeline. Each keyframe sets the speed until the next one.
+/// The first keyframe stays on the first frame. The others move between their neighbors, never past them.
+/// Click a section to select its keyframe. Double-click the bar to add a keyframe there.
+/// Drag a keyframe to move it, with Option for finer steps. The video shows the frame under it.
+/// With a keyframe selected, the arrow keys nudge it one frame and Delete removes it.
+struct SpeedTimeline: View {
+    @Bindable var history: EditHistory
+    let playback: PlaybackState
+    @State private var selected: Int?
+    /// The dragged keyframe's position in frames, kept fractional so Option can slow it down mid-drag.
+    @State private var dragFrame: Double?
+    @State private var lastTranslation: CGFloat = 0
+    @FocusState private var focused: Bool
+    /// The slider's thumb travels half a thumb in from each end.
+    private let inset: CGFloat = 10
+    private var keyframes: [SpeedChange] { history.speeds.keyframes }
+    private var lastFrame: Int { max(1, playback.frameCount - 1) }
+    
+    var body: some View {
+        GeometryReader { geometry in
+            let travel = max(1, geometry.size.width - inset * 2)
+            ZStack(alignment: .topLeading) {
+                /// One click handler, so a single click selects at once. The second click of a double-click adds a keyframe.
+                sectionBars(travel: travel)
+                    .contentShape(Rectangle())
+                    .onTapGesture { location in
+                        let clicked = frame(atX: location.x, travel: travel)
+                        if NSApp.currentEvent?.clickCount == 2 { addKeyframe(at: clicked) } else { selectSection(containing: clicked) }
+                    }
+                ForEach(Array(keyframes.enumerated()), id: \.offset) { index, keyframe in
+                    handle(selected: selected == index && focused)
+                        .position(x: x(for: keyframe.frame, travel: travel), y: geometry.size.height / 2)
+                        .gesture(drag(index: index, travel: travel))
+                        .contextMenu {
+                            if index > 0 {
+                                Button("Remove Keyframe", role: .destructive) { remove(index) }
+                            }
+                        }
+                        .help(index == 0 ? "First keyframe" : "Frame \(keyframe.frame + 1). Drag to move, Option-drag for finer steps.")
+                }
+            }
+        }
+        .frame(height: 16)
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focused)
+        .onKeyPress(.leftArrow) { nudge(-1) }
+        .onKeyPress(.rightArrow) { nudge(1) }
+        /// Delete is the backspace key on a Mac keyboard. Forward delete works too.
+        .onKeyPress(keys: [.delete, .deleteForward, KeyEquivalent("\u{7F}")]) { _ in removeSelected() }
+        .accessibilityLabel("Speed keyframes")
+    }
+    
+    // MARK: Drawing
+    
+    /// One bar per section, labeled with its speed when there is room.
+    private func sectionBars(travel: CGFloat) -> some View {
+        Canvas { context, size in
+            for (index, keyframe) in keyframes.enumerated() {
+                let end = index + 1 < keyframes.count ? keyframes[index + 1].frame : lastFrame
+                let left = x(for: keyframe.frame, travel: travel) + 1
+                let right = x(for: end, travel: travel) - 1
+                guard right > left else { continue }
+                let bar = CGRect(x: left, y: 3, width: right - left, height: size.height - 6)
+                let fast = keyframe.speed != 1
+                let strength = 0.45 + 0.55 * min(1, (keyframe.speed - 1) / 9)
+                context.fill(
+                    Path(roundedRect: bar, cornerRadius: 3),
+                    with: .color(fast ? CropAppearance.exportAccent.opacity(strength) : Color.secondary.opacity(0.25)))
+                if bar.width > 28 {
+                    let label = Text(SpeedInspectorSection.label(keyframe.speed))
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(fast ? Color.white : Color.secondary)
+                    context.draw(label, at: CGPoint(x: bar.midX, y: bar.midY))
+                }
+            }
+        }
+    }
+    
+    private func handle(selected: Bool) -> some View {
+        Capsule()
+            .fill(selected ? CropAppearance.exportAccent : Color.primary.opacity(0.75))
+            .frame(width: selected ? 4 : 3, height: 16)
+            .frame(width: 14, height: 20)
+            .contentShape(Rectangle())
+    }
+    
+    private func x(for frame: Int, travel: CGFloat) -> CGFloat {
+        inset + CGFloat(frame) / CGFloat(lastFrame) * travel
+    }
+    
+    private func frame(atX x: CGFloat, travel: CGFloat) -> Int {
+        min(max(0, Int(((x - inset) / travel * CGFloat(lastFrame)).rounded())), lastFrame)
+    }
+    
+    // MARK: Editing
+    
+    /// Selecting a keyframe moves the playhead to it, so the inspector and canvas show the same section.
+    private func select(_ index: Int) {
+        selected = index
+        focused = true
+        if keyframes.indices.contains(index) { playback.framePosition = Double(keyframes[index].frame) }
+    }
+    
+    private func selectSection(containing frame: Int) {
+        select(keyframes.lastIndex(where: { $0.frame <= frame }) ?? 0)
+    }
+    
+    /// A new keyframe starts at the speed already playing there.
+    private func addKeyframe(at frame: Int) {
+        let added = keyframes.splitting(at: frame)
+        guard added != keyframes else { return }
+        history.speeds = added
+        if let index = added.firstIndex(where: { $0.frame == frame }) { select(index) }
+        playback.framePosition = Double(frame)
+    }
+    
+    /// One drag is one undo step. Frames snap to whole numbers. The first keyframe only gets selected.
+    private func drag(index: Int, travel: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                if dragFrame == nil {
+                    guard keyframes.indices.contains(index) else { return }
+                    select(index)
+                    guard index > 0 else { return }
+                    history.begin()
+                    dragFrame = Double(keyframes[index].frame)
+                    lastTranslation = 0
+                }
+                guard index > 0, let start = dragFrame else { return }
+                let pointsPerFrame = travel / CGFloat(lastFrame) * (NSEvent.modifierFlags.contains(.option) ? 10 : 1)
+                let position = start + Double((value.translation.width - lastTranslation) / pointsPerFrame)
+                dragFrame = position
+                lastTranslation = value.translation.width
+                move(index, to: Int(position.rounded()))
+            }
+            .onEnded { _ in
+                if dragFrame != nil { history.end() }
+                dragFrame = nil
+            }
+    }
+    
+    /// Move a keyframe and show its frame on the canvas.
+    private func move(_ index: Int, to frame: Int) {
+        let moved = keyframes.moving(index, to: frame, frameCount: playback.frameCount)
+        if moved != keyframes { history.speeds = moved }
+        if moved.indices.contains(index) { playback.framePosition = Double(moved[index].frame) }
+    }
+    
+    private func nudge(_ amount: Int) -> KeyPress.Result {
+        guard let selected, selected > 0, keyframes.indices.contains(selected) else { return .ignored }
+        move(selected, to: keyframes[selected].frame + amount)
+        return .handled
+    }
+    
+    /// The section joins the one before it.
+    private func remove(_ index: Int) {
+        guard index > 0, keyframes.indices.contains(index) else { return }
+        var remaining = keyframes
+        remaining.remove(at: index)
+        history.speeds = remaining
+        selected = nil
+    }
+    
+    private func removeSelected() -> KeyPress.Result {
+        guard let selected, selected > 0, keyframes.indices.contains(selected) else { return .ignored }
+        remove(selected)
+        return .handled
     }
 }
 
@@ -1694,6 +1998,7 @@ struct CropEdit: Equatable {
     var encoding = EncodingSettings()
     var imageEncoding = ImageEncodingSettings()
     var exportsFrame = false
+    var speeds: [SpeedChange] = []
 }
 
 /// Stores crop and encoding changes so they can be undone.
@@ -1705,11 +2010,19 @@ final class EditHistory {
     private var resizeCenter: CGPoint?
     private var currentCodec = EncodingSettings.Codec.hevc
     private var currentBitrate = 2.5
+    private var currentContainer = VideoContainer.preferred
+    private var currentOutputWidth: Int?
     private var currentImageEncoding = ImageEncodingSettings()
     private var currentExportsFrame = false
+    private var currentSpeeds: [SpeedChange] = []
     /// Videos use even dimensions. Images can be cropped one pixel at a time.
     var pixelStep = 2
-    var value: CropEdit { CropEdit(crop: currentCrop, encoding: EncodingSettings(codec: currentCodec, megabitsPerSecond: currentBitrate), imageEncoding: currentImageEncoding, exportsFrame: currentExportsFrame) }
+    var value: CropEdit {
+        CropEdit(
+            crop: currentCrop,
+            encoding: EncodingSettings(codec: currentCodec, megabitsPerSecond: currentBitrate, container: currentContainer, outputWidth: currentOutputWidth),
+            imageEncoding: currentImageEncoding, exportsFrame: currentExportsFrame, speeds: currentSpeeds)
+    }
     var exportsFrame: Bool { currentExportsFrame }
     var exportFormat: ExportFormat {
         get {
@@ -1776,6 +2089,32 @@ final class EditHistory {
             set(edit)
         }
     }
+    /// The chosen container is also remembered for the next video.
+    var container: VideoContainer {
+        get { currentContainer }
+        set {
+            var edit = value
+            edit.encoding.container = newValue
+            set(edit)
+            VideoContainer.preferred = newValue
+        }
+    }
+    var outputWidth: Int? {
+        get { currentOutputWidth }
+        set {
+            var edit = value
+            edit.encoding.outputWidth = newValue
+            set(edit)
+        }
+    }
+    var speeds: [SpeedChange] {
+        get { currentSpeeds }
+        set {
+            var edit = value
+            edit.speeds = newValue
+            set(edit)
+        }
+    }
     /// Resize around the same center until the crop is moved or its margins are edited.
     func resizeCrop(width: Int, height: Int, in size: CGSize) {
         let rectangle = crop.rectangle(in: size)
@@ -1809,8 +2148,11 @@ final class EditHistory {
         currentCrop = edit.crop
         currentCodec = edit.encoding.codec
         currentBitrate = edit.encoding.megabitsPerSecond
+        currentContainer = edit.encoding.container
+        currentOutputWidth = edit.encoding.outputWidth
         currentImageEncoding = edit.imageEncoding
         currentExportsFrame = edit.exportsFrame
+        currentSpeeds = edit.speeds
     }
     private func register(_ previous: CropEdit) {
         let grouping = !manager.isUndoing && !manager.isRedoing
@@ -2291,6 +2633,8 @@ final class PlaybackState {
     private(set) var isMuted = false
     private(set) var duration = 0.0
     private(set) var frames = VideoFrameIndex(times: [])
+    /// The export speeds. Playback follows them.
+    var speeds: [SpeedChange] = []
     @ObservationIgnored private var player: AVPlayer?
     @ObservationIgnored private var timeObserver: Any?
     @ObservationIgnored private var rateObserver: NSKeyValueObservation?
@@ -2327,6 +2671,7 @@ final class PlaybackState {
             MainActor.assumeIsolated {
                 guard let self, !self.scrubbing, self.reverseTimer == nil, self.seekTarget == nil else { return }
                 self.updatePosition(time)
+                self.followSpeed()
             }
         }
         rateObserver = player.observe(\.rate, options: [.initial, .new]) { [weak self] observed, _ in
@@ -2358,6 +2703,13 @@ final class PlaybackState {
                 self.selectedFrame = endedBackward ? 0 : max(0, self.frameCount - 1)
             }
         }
+    }
+    
+    /// While playing, play each section at its export speed.
+    private func followSpeed() {
+        guard let player, player.rate > 0 else { return }
+        let speed = Float(speeds.speed(at: selectedFrame))
+        if player.rate != speed { player.rate = speed }
     }
     
     /// Silence the canvas video while checking the crop.
@@ -2567,6 +2919,7 @@ struct PlaybackReadout: View {
 /// Playback, frame scrubbing, frame stepping, time, and mute.
 struct PlaybackControls: View {
     @Bindable var playback: PlaybackState
+    let history: EditHistory
     
     var body: some View {
         let totalFrames = String(playback.frameCount)
@@ -2588,8 +2941,12 @@ struct PlaybackControls: View {
                     .disabled(playback.selectedFrame >= playback.frameCount - 1)
                     .help("Next frame (])")
             }
-            PlaybackTimeline(playback: playback)
-                .disabled(playback.frameCount < 2)
+            /// Speed keyframes sit under the timeline, aligned with its frames.
+            VStack(spacing: 2) {
+                PlaybackTimeline(playback: playback)
+                    .disabled(playback.frameCount < 2)
+                SpeedTimeline(history: history, playback: playback)
+            }
             PlaybackReadout(text: "\(playback.selectedFrame + 1)/\(totalFrames)", reservation: "\(totalFrames)/\(totalFrames)")
                 .accessibilityLabel("Frame \(playback.selectedFrame + 1) of \(playback.frameCount)")
                 .help("\(currentSeconds) / \(totalSeconds) s")
@@ -4023,6 +4380,17 @@ struct EncodingSettings: Sendable, Equatable {
     
     var codec: Codec = .hevc
     var megabitsPerSecond = 2.5
+    var container = VideoContainer.preferred
+    /// The exported width. Nil exports the crop at its own size.
+    var outputWidth: Int? = nil
+    
+    /// The exported size: the chosen width with the crop's proportions, in even pixels.
+    func outputSize(for crop: CGSize) -> CGSize {
+        guard let outputWidth, crop.width > 0, crop.height > 0 else { return crop }
+        let width = max(2, outputWidth / 2 * 2)
+        let height = max(2, Int((Double(width) * crop.height / crop.width / 2).rounded()) * 2)
+        return CGSize(width: width, height: height)
+    }
     
     /// The menu and slider use the same bitrate limits for the opened video.
     static func bitrateRange(for sourceMbps: Double) -> ClosedRange<Double> {
@@ -4030,6 +4398,105 @@ struct EncodingSettings: Sendable, Equatable {
     }
     
     var isValid: Bool { megabitsPerSecond.isFinite && (0.01...10000).contains(megabitsPerSecond) }
+}
+
+/// The exported file. MOV keeps Apple metadata such as Retina sizing. MP4 plays everywhere on the web.
+enum VideoContainer: String, CaseIterable, Identifiable, Sendable {
+    case mp4 = "MP4"
+    case mov = "MOV"
+    
+    var id: String { rawValue }
+    var fileType: AVFileType { self == .mp4 ? .mp4 : .mov }
+    var contentType: UTType { self == .mp4 ? .mpeg4Movie : .quickTimeMovie }
+    var fileExtension: String { self == .mp4 ? "mp4" : "mov" }
+    
+    /// The last container chosen, kept between exports.
+    static var preferred: VideoContainer {
+        get { UserDefaults.standard.string(forKey: "VideoContainer").flatMap(VideoContainer.init(rawValue:)) ?? .mp4 }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "VideoContainer") }
+    }
+}
+
+/// From this frame until the next change, the video plays at this speed.
+struct SpeedChange: Equatable, Sendable {
+    var frame: Int
+    var speed: Double
+    
+    /// The speeds offered in the inspector.
+    static let steps: [Double] = [1, 1.5, 2, 3, 4, 6, 8, 10]
+}
+
+/// A part of the source video and the speed it is exported at.
+struct SpeedSection: Sendable {
+    let range: CMTimeRange
+    let speed: Double
+}
+
+extension Array where Element == SpeedChange {
+    /// The keyframes, always starting with one on the first frame. An empty list means the whole video at 1×.
+    var keyframes: [SpeedChange] { first?.frame == 0 ? self : [SpeedChange(frame: 0, speed: 1)] + self }
+    
+    /// Whether anything differs from the video at 1× with a single keyframe.
+    var isEdited: Bool { keyframes.count > 1 || keyframes.contains { $0.speed != 1 } }
+    
+    /// The speed in effect at a frame. The video starts at 1×.
+    func speed(at frame: Int) -> Double {
+        last(where: { $0.frame <= frame })?.speed ?? 1
+    }
+    
+    /// Set the speed of the section that contains this frame.
+    func settingSpeed(_ speed: Double, forSectionAt frame: Int) -> [SpeedChange] {
+        var changes = self
+        if let index = changes.lastIndex(where: { $0.frame <= frame }) {
+            changes[index].speed = speed
+        } else {
+            changes.insert(SpeedChange(frame: 0, speed: speed), at: 0)
+        }
+        return changes
+    }
+    
+    /// Start a new section at this frame, at the speed it already plays at.
+    func splitting(at frame: Int) -> [SpeedChange] {
+        guard frame > 0, !contains(where: { $0.frame == frame }) else { return self }
+        var changes = self
+        changes.append(SpeedChange(frame: frame, speed: speed(at: frame)))
+        changes.sort { $0.frame < $1.frame }
+        return changes
+    }
+    
+    /// Move a change to a frame, between its neighbors.
+    func moving(_ index: Int, to frame: Int, frameCount: Int) -> [SpeedChange] {
+        guard indices.contains(index) else { return self }
+        let lower = index > 0 ? self[index - 1].frame + 1 : 0
+        let upper = Swift.max(lower, index + 1 < count ? self[index + 1].frame - 1 : frameCount - 1)
+        var changes = self
+        changes[index].frame = Swift.min(Swift.max(frame, lower), upper)
+        return changes
+    }
+    
+    /// The source video cut into sections, one per speed, in time.
+    func sections(times: [CMTime], duration: CMTime) -> [SpeedSection] {
+        var sections: [SpeedSection] = []
+        var start = CMTime.zero
+        var speed = 1.0
+        for change in self where times.indices.contains(change.frame) {
+            let time = change.frame == 0 ? .zero : times[change.frame]
+            if CMTimeCompare(time, start) > 0 {
+                sections.append(SpeedSection(range: CMTimeRange(start: start, end: time), speed: speed))
+                start = time
+            }
+            speed = change.speed
+        }
+        if CMTimeCompare(duration, start) > 0 {
+            sections.append(SpeedSection(range: CMTimeRange(start: start, end: duration), speed: speed))
+        }
+        return sections
+    }
+}
+
+extension Array where Element == SpeedSection {
+    /// The exported length in seconds.
+    var outputSeconds: Double { reduce(0) { $0 + $1.range.duration.seconds / $1.speed } }
 }
 
 /// The video’s color information, including whether it uses HDR.
@@ -4043,7 +4510,8 @@ struct CropVideoColor: Sendable {
     }
 }
 
-/// Crop and encode the video, then copy its original audio into the MOV file.
+/// Crop, resize and speed up the video, then encode it into an MP4 or MOV file.
+/// Audio is copied untouched, unless a speed change or the container needs it re-encoded.
 enum VideoExporter {
     /// Read the video’s size and rotation so the crop matches what you see.
     static func geometry(for asset: AVAsset) async throws -> (track: AVAssetTrack, bounds: CGRect, transform: CGAffineTransform) {
@@ -4071,7 +4539,7 @@ enum VideoExporter {
     
     /// Export the selected crop with the chosen codec and bitrate.
     static func export(
-        source: URL, destination: URL, crop: CGRect, settings: EncodingSettings, fill: ImageBackground = ImageBackground(), fileSize: @escaping @Sendable (Int64) -> Void = { _ in },
+        source: URL, destination: URL, crop: CGRect, settings: EncodingSettings, speedSections: [SpeedSection] = [], fill: ImageBackground = ImageBackground(), fileSize: @escaping @Sendable (Int64) -> Void = { _ in },
         progress: @escaping @Sendable (Double) -> Void = { _ in }
     ) async throws {
         let asset = AVURLAsset(url: source)
@@ -4082,24 +4550,66 @@ enum VideoExporter {
                 else {
             throw failure("Choose even output dimensions between 2 and 16384 pixels.")
         }
+        let outputSize = settings.outputSize(for: crop.size)
+        guard outputSize.width >= 2, outputSize.height >= 2,
+              outputSize.width <= CGFloat(CropMargins.maximumDimension), outputSize.height <= CGFloat(CropMargins.maximumDimension)
+        else {
+            throw failure("Choose an output size between 2 and 16384 pixels.")
+        }
         let color = try await colorInfo(for: geometry.track)
         guard !color.isHDR || settings.codec == .hevc else {
             throw failure("HDR video requires HEVC. Select HEVC to preserve the video's dynamic range.")
         }
         let duration = try await asset.load(.duration)
+        
+        /// Speed changes play each section faster in a composition. Without them, read the file directly.
+        var reading: AVAsset = asset
+        var videoTrack = geometry.track
+        var audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        var outputDuration = duration
+        let speeding = speedSections.contains { $0.speed != 1 }
+        if speeding {
+            let composition = AVMutableComposition()
+            guard let compositionVideo = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                throw failure("Cannot prepare the speed changes.")
+            }
+            try compositionVideo.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: geometry.track, at: .zero)
+            compositionVideo.preferredTransform = try await geometry.track.load(.preferredTransform)
+            var compositionAudio: [AVAssetTrack] = []
+            for track in audioTracks {
+                guard let added = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { continue }
+                let range = try await track.load(.timeRange)
+                try added.insertTimeRange(range, of: track, at: range.start)
+                compositionAudio.append(added)
+            }
+            /// Scale from the end, so the sections before keep their times.
+            for section in speedSections.reversed() where section.speed != 1 {
+                composition.scaleTimeRange(section.range, toDuration: CMTimeMultiplyByFloat64(section.range.duration, multiplier: 1 / section.speed))
+            }
+            reading = composition
+            videoTrack = compositionVideo
+            audioTracks = compositionAudio
+            outputDuration = composition.duration
+        }
+        
         let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
-        let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: geometry.track)
-        let cropTransform = geometry.transform.concatenating(CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
+        instruction.timeRange = CMTimeRange(start: .zero, duration: outputDuration)
+        let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
+        /// Crop, then scale the crop to the output size.
+        let cropTransform = geometry.transform
+            .concatenating(CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
+            .concatenating(CGAffineTransform(scaleX: outputSize.width / crop.width, y: outputSize.height / crop.height))
         layer.setTransform(cropTransform, at: .zero)
         instruction.layerInstructions = [layer]
         /// Fill the space around the video with the chosen export color.
         instruction.backgroundColor = NSColor(fill.color).cgColor
         
-        /// Use the original frame rate and colors when rendering the crop.
+        /// Use the original frame rate and colors. Faster sections keep that frame rate by dropping frames.
         let composition = try await AVMutableVideoComposition.videoComposition(withPropertiesOf: asset)
         composition.instructions = [instruction]
-        composition.renderSize = crop.size
+        composition.renderSize = outputSize
+        /// Frames follow the fixed frame rate, not the source's samples, so faster sections drop frames.
+        if speeding { composition.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid }
         if color.isHDR {
             /// Keep the video in HDR.
             composition.colorPrimaries = color.primaries ?? AVVideoColorPrimaries_ITU_R_2020
@@ -4112,9 +4622,9 @@ enum VideoExporter {
         let stagingDirectory = destination.deletingLastPathComponent().appendingPathComponent("GoodFrame-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: stagingDirectory) }
-        let temporaryURL = stagingDirectory.appendingPathComponent("Export.mov")
-        let reader = try AVAssetReader(asset: asset)
-        let writer = try AVAssetWriter(outputURL: temporaryURL, fileType: .mov)
+        let temporaryURL = stagingDirectory.appendingPathComponent("Export").appendingPathExtension(settings.container.fileExtension)
+        let reader = try AVAssetReader(asset: reading)
+        let writer = try AVAssetWriter(outputURL: temporaryURL, fileType: settings.container.fileType)
         /// Measure the file size while exporting.
         let sizeMonitor = Task {
             while !Task.isCancelled {
@@ -4128,7 +4638,7 @@ enum VideoExporter {
         defer { sizeMonitor.cancel() }
         writer.shouldOptimizeForNetworkUse = true
         let videoOutput = AVAssetReaderVideoCompositionOutput(
-            videoTracks: [geometry.track],
+            videoTracks: [videoTrack],
             videoSettings: [
                 kCVPixelBufferPixelFormatTypeKey as String: color.isHDR
                 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -4148,8 +4658,8 @@ enum VideoExporter {
         }
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: settings.codec.avCodec,
-            AVVideoWidthKey: Int(crop.width),
-            AVVideoHeightKey: Int(crop.height),
+            AVVideoWidthKey: Int(outputSize.width),
+            AVVideoHeightKey: Int(outputSize.height),
             AVVideoColorPropertiesKey: [
                 AVVideoColorPrimariesKey: composition.colorPrimaries ?? AVVideoColorPrimaries_ITU_R_709_2,
                 AVVideoTransferFunctionKey: composition.colorTransferFunction ?? AVVideoTransferFunction_ITU_R_709_2,
@@ -4161,7 +4671,10 @@ enum VideoExporter {
             throw failure("This codec or encoding configuration is unavailable on this Mac.")
         }
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        videoInput.metadata = try await displayDensity(from: geometry.track, croppedSize: crop.size)
+        /// Retina sizing is QuickTime metadata, kept in MOV only.
+        if settings.container == .mov {
+            videoInput.metadata = try await displayDensity(from: geometry.track, croppedSize: outputSize)
+        }
         guard reader.canAdd(videoOutput), writer.canAdd(videoInput) else {
             throw failure("Cannot configure the video pipeline.")
         }
@@ -4169,21 +4682,42 @@ enum VideoExporter {
         writer.add(videoInput)
         
         /// Copy each original audio track without decoding or recompressing it.
-        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
-        var audioTransfers: [(output: AVAssetReaderTrackOutput, input: AVAssetWriterInput)] = []
-        for track in audioTracks {
-            guard let format = try await track.load(.formatDescriptions).first else {
-                throw failure("Cannot read the original audio format.")
+        var audioTransfers: [(output: AVAssetReaderOutput, input: AVAssetWriterInput)] = []
+        var copies: [(output: AVAssetReaderTrackOutput, input: AVAssetWriterInput)] = []
+        if !speeding {
+            for track in audioTracks {
+                guard let format = try await track.load(.formatDescriptions).first else {
+                    throw failure("Cannot read the original audio format.")
+                }
+                let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+                output.alwaysCopiesSampleData = false
+                let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: format)
+                input.languageCode = try await track.load(.languageCode)
+                input.extendedLanguageTag = try await track.load(.extendedLanguageTag)
+                input.metadata = try await track.load(.metadata)
+                input.marksOutputTrackAsEnabled = try await track.load(.isEnabled)
+                copies.append((output: output, input: input))
             }
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-            output.alwaysCopiesSampleData = false
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: format)
-            input.languageCode = try await track.load(.languageCode)
-            input.extendedLanguageTag = try await track.load(.extendedLanguageTag)
-            input.metadata = try await track.load(.metadata)
-            input.marksOutputTrackAsEnabled = try await track.load(.isEnabled)
+        }
+        if !speeding, copies.allSatisfy({ reader.canAdd($0.output) && writer.canAdd($0.input) }) {
+            for copy in copies {
+                reader.add(copy.output)
+                writer.add(copy.input)
+                audioTransfers.append((output: copy.output, input: copy.input))
+            }
+        } else if !audioTracks.isEmpty {
+            /// A speed change, or audio the container can't hold: decode, keep the pitch, and encode as AAC.
+            let decoded: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2,
+                AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false,
+            ]
+            let output = AVAssetReaderAudioMixOutput(audioTracks: audioTracks, audioSettings: decoded)
+            output.audioTimePitchAlgorithm = .spectral
+            let input = AVAssetWriterInput(
+                mediaType: .audio,
+                outputSettings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2, AVEncoderBitRateKey: 192_000])
             guard reader.canAdd(output), writer.canAdd(input) else {
-                throw failure("The original audio cannot be copied into a MOV file.")
+                throw failure("Cannot prepare the audio for this export.")
             }
             reader.add(output)
             writer.add(input)
@@ -4200,7 +4734,7 @@ enum VideoExporter {
             /// Process audio and video concurrently.
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask {
-                    try await transfer(videoOutput, to: videoInput, reader: reader, writer: writer, duration: duration.seconds, progress: progress)
+                    try await transfer(videoOutput, to: videoInput, reader: reader, writer: writer, duration: outputDuration.seconds, progress: progress)
                 }
                 for audio in audioTransfers {
                     group.addTask { try await transfer(audio.output, to: audio.input, reader: reader, writer: writer) }
@@ -4212,7 +4746,7 @@ enum VideoExporter {
                 throw reader.error ?? failure("Decoding did not complete.")
             }
             progress(0.99)
-            writer.endSession(atSourceTime: duration)
+            writer.endSession(atSourceTime: outputDuration)
             await writer.finishWriting()
             guard writer.status == .completed else {
                 throw writer.error ?? failure("Encoding did not complete.")
@@ -4374,7 +4908,7 @@ final class ExportDocument: NSDocument {
         updateChangeCount(.changeDone)
     }
     
-    override class var writableTypes: [String] { [UTType.quickTimeMovie.identifier, UTType.png.identifier, UTType.jpeg.identifier] }
+    override class var writableTypes: [String] { [UTType.quickTimeMovie.identifier, UTType.mpeg4Movie.identifier, UTType.png.identifier, UTType.jpeg.identifier] }
     
     override class var autosavesInPlace: Bool { false }
     
