@@ -15,3 +15,6 @@ Build/
 *.dmg
 *.zip
 .DS_Store
+
+# Local release helper.
+Zip.command

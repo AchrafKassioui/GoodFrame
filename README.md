@@ -13,10 +13,9 @@ Good Frame is a **Mac app** for cropping, resizing, speeding, and encoding video
 
 Requires macOS 15.6 or later.
 
-1. Download or clone this repository.
-2. Open `GoodFrame.xcodeproj` in Xcode.
-3. Build and run on Mac.
-4. To keep the app in Applications, go to **Product → Show Build Folder in Finder**, open **Products → Debug**, and copy **Good Frame.app** into **Applications**.
+**Download:** get the app from [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-frame).
+
+**Build from source:** with Xcode installed, download or clone this repository and double-click `Install.command`. It builds Good Frame and puts it in the Applications folder.
 
 ## Demo & Features
 
@@ -31,6 +30,7 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 - Export videos as MP4 or MOV.
 - New Speed menu. Play and pause with Space.
 - Confirmation before quitting during an export.
+- New `Install.command` script.
 
 ### 1.4
 
