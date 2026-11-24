@@ -23,6 +23,10 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 
 ## Change Log
 
+### 1.7.1
+
+- Export still works after the original file is renamed, moved, or put in the Trash. If the file was permanently deleted, exporting doesn't start and a message says so.
+
 ### 1.7
 
 - Cut a section in a video with the `Skip` option. Skipped sections don't play or export.

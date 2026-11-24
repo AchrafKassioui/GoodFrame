@@ -6,7 +6,7 @@
  
  Achraf Kassioui
  Created 20 Oct 2026
- Updated 23 Nov 2026
+ Updated 24 Nov 2026
  
  */
 @preconcurrency import AVFoundation
@@ -372,7 +372,7 @@ struct CropWindowCommands: Commands {
 struct EditorView: View {
     let windowIdentity: UUID
     init(windowIdentity: UUID = UUID()) { self.windowIdentity = windowIdentity }
-    @State private var sourceURL: URL?
+    @State private var source: SourceFile?
     @State private var pastedMediaFile: PastedMediaFile?
     @Environment(\.openWindow) private var openWindow
     @State private var player: AVPlayer?
@@ -406,7 +406,7 @@ struct EditorView: View {
     @State private var exportTask: Task<Void, Never>?
     @State private var exportError: String?
     
-    private var loaded: Bool { sourceURL != nil }
+    private var loaded: Bool { source != nil }
     /// An empty editor can receive a Finder file. Occupied editors let SwiftUI open another scene.
     private var incomingFileEvents: Set<String> { !loaded && !busy ? ["*"] : [] }
     private var isImage: Bool { imageSource != nil }
@@ -472,7 +472,7 @@ struct EditorView: View {
         }
         .environment(\.locale, CropFormatting.locale)
         /// Get the product name from project settings and display in title bar
-        .navigationTitle(sourceURL?.lastPathComponent ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? ""))
+        .navigationTitle(source?.url.lastPathComponent ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? ""))
         .background {
             EditorToolbar(
                 zoom: $zoom, fit: $fit, loaded: loaded, busy: busy,
@@ -625,7 +625,7 @@ struct EditorView: View {
         playback.disconnect()
         player = nil
         imageSource = nil
-        sourceURL = nil
+        source = nil
         pastedMediaFile?.remove()
         pastedMediaFile = nil
         sourceSize = .zero
@@ -657,7 +657,7 @@ struct EditorView: View {
                     playback.disconnect()
                     player = nil
                     imageSource = source
-                    sourceURL = selectedURL
+                    self.source = try SourceFile(url: selectedURL)
                     if pastedMediaFile?.url != selectedURL {
                         pastedMediaFile?.remove()
                         pastedMediaFile = pastedFile
@@ -695,7 +695,7 @@ struct EditorView: View {
                 sourceSize = geometry.bounds.size
                 sourceMbps = Double(dataRate) / 1_000_000
                 sourceFPS = Double(frameRate)
-                sourceURL = selectedURL
+                source = try SourceFile(url: selectedURL)
                 if pastedMediaFile?.url != selectedURL {
                     pastedMediaFile?.remove()
                     pastedMediaFile = pastedFile
@@ -717,6 +717,16 @@ struct EditorView: View {
                 pastedFile?.remove()
                 openError = error.localizedDescription
             }
+        }
+    }
+    
+    /// The opened file where it is now. Shows an error when it was deleted.
+    private func locateSource() -> URL? {
+        do {
+            return try source?.locate()
+        } catch {
+            exportError = error.localizedDescription
+            return nil
         }
     }
     
@@ -793,7 +803,7 @@ struct EditorView: View {
         /// Remember which window started this export.
         let exportWindow = NSApp.keyWindow
         NSApp.keyWindow?.makeFirstResponder(nil)
-        guard canExport, let sourceURL else { return }
+        guard canExport, let sourceURL = locateSource() else { return }
         if imageSource != nil || history.exportsFrame {
             exportImage(sourceURL: sourceURL)
             return
@@ -940,6 +950,31 @@ enum MediaClipboard {
 }
 
 /// Keep clipboard media available until its editor closes the file.
+/// The opened file, remembered by identity instead of by path.
+/// It can be renamed, moved, or put in the Trash while the window is open, and exports still find it.
+struct SourceFile {
+    /// Where the file was when last found. The window title shows its name.
+    private(set) var url: URL
+    private let bookmark: Data
+    
+    init(url: URL) throws {
+        self.url = url
+        bookmark = try url.bookmarkData()
+    }
+    
+    /// Find the file where it is now. Fails with a clear message once it's deleted.
+    mutating func locate() throws -> URL {
+        var stale = false
+        guard let found = try? URL(resolvingBookmarkData: bookmark, options: [.withoutUI, .withoutMounting], bookmarkDataIsStale: &stale),
+              FileManager.default.fileExists(atPath: found.path) else {
+            throw NSError(domain: "GoodFrame", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: String(localized: "“\(url.lastPathComponent)” was deleted. Open the file again to export it.")])
+        }
+        url = found
+        return found
+    }
+}
+
 final class PastedMediaFile {
     let url: URL
     private let directory: URL
