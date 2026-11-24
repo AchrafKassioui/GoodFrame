@@ -278,14 +278,14 @@ struct CropWindowCommands: Commands {
         /// Like the inspector: split at the playhead, and set the speed of the selected keyframe's section or the one under the playhead.
         CommandMenu("Speed") {
             Group {
-                Button("Split at Current Frame") { history?.splitSpeed(at: speedFrame) }
+                Button("Split at Current Frame") { history?.splitSpeed(at: playback?.selectedFrame ?? 0) }
                     .keyboardShortcut("b")
-                    .disabled(speedFrame == 0 || speeds.contains { $0.frame == speedFrame })
-                Picker("Section Speed", selection: Binding(
-                    get: { speeds.speed(at: speedTarget) },
-                    set: { history?.speeds = speeds.settingSpeed($0, forSectionAt: speedTarget) })) {
-                        ForEach(SpeedChange.steps, id: \.self) { Text(SpeedInspectorSection.label($0)).tag($0) }
+                    .disabled(history?.speedTarget.canSplit != true)
+                if let history {
+                    Picker("Section Speed", selection: Bindable(history).targetPace) {
+                        SpeedInspectorSection.paceOptions
                     }
+                }
                 Divider()
                 Button("Remove Selected Speed Change") {
                     guard let history, let index = history.selectedSpeedIndex else { return }
@@ -295,6 +295,10 @@ struct CropWindowCommands: Commands {
                 .disabled(history?.selectedSpeedIndex == nil)
                 Button("Remove All Speed Changes") { history?.speeds = [] }
                     .disabled(speeds.isEmpty)
+                Divider()
+                Toggle("Playhead Follows Moved Keyframe", isOn: Binding(
+                    get: { playback?.followsMovedKeyframe == true },
+                    set: { playback?.followsMovedKeyframe = $0 }))
             }
             .disabled(playback == nil || history?.exportsFrame == true)
         }
@@ -349,8 +353,6 @@ struct CropWindowCommands: Commands {
     }
     
     private var speeds: [SpeedChange] { history?.speeds ?? [] }
-    private var speedFrame: Int { playback?.selectedFrame ?? 0 }
-    private var speedTarget: Int { history?.speedTarget(playhead: speedFrame) ?? speedFrame }
     
     /// Give the menu the same quality range as the inspector slider.
     private func adjustQuality(by amount: Double) {
@@ -391,8 +393,8 @@ struct EditorView: View {
     @State private var history = EditHistory()
     @State private var cameraRequest = 0
     @State private var centerCameraOnRequest = true
-    private var crop: CropMargins { history.value.crop }
-    private var settings: EncodingSettings { history.value.encoding }
+    private var crop: CropMargins { history.crop }
+    private var settings: EncodingSettings { history.encoding }
     
     private var cropBinding: Binding<CropMargins> { $history.crop }
     @State private var zoom = 1.0
@@ -450,8 +452,6 @@ struct EditorView: View {
                         .position(layout.playbackCenter)
                 }
             }
-            /// Preview playback follows the export speeds.
-            .onChange(of: history.speeds, initial: true) { playback.speeds = history.speeds }
         }
         .inspector(isPresented: Binding(get: { loaded && showInspector }, set: { showInspector = $0 })) {
             InspectorView(
@@ -704,7 +704,7 @@ struct EditorView: View {
                 player?.pause()
                 let openedPlayer = AVPlayer(url: selectedURL)
                 player = openedPlayer
-                playback.connect(to: openedPlayer, frames: frames, duration: duration)
+                playback.connect(to: openedPlayer, frames: frames, duration: duration, history: history)
                 let originalRate = originalBitrate
                 history.reset(
                     CropEdit(
@@ -1279,7 +1279,7 @@ struct InspectorView: View {
     /// The exported video size: the crop, resized when an output width is set.
     private var exportSize: CGSize {
         guard imageSource == nil, !history.exportsFrame else { return CGSize(width: outputWidth, height: outputHeight) }
-        return history.value.encoding.outputSize(for: CGSize(width: outputWidth, height: outputHeight))
+        return history.encoding.outputSize(for: CGSize(width: outputWidth, height: outputHeight))
     }
     
     /// Arrange the inspector controls in sections.
@@ -1513,7 +1513,7 @@ struct CropEncodingSection: View {
     let isHDR: Bool
     let hasTransparency: Bool
     let cropSize: CGSize
-    private var outputSize: CGSize { history.value.encoding.outputSize(for: cropSize) }
+    private var outputSize: CGSize { history.encoding.outputSize(for: cropSize) }
     
     var body: some View {
         CropInspectorSection("Encoding") {
@@ -1589,22 +1589,18 @@ struct SpeedInspectorSection: View {
     let playback: PlaybackState
     let duration: Double
     
-    private var frame: Int { playback.selectedFrame }
-    private var target: Int { history.speedTarget(playhead: frame) }
+    private var target: EditHistory.SpeedTarget { history.speedTarget }
     private var speeds: [SpeedChange] { history.speeds }
     private var outputSeconds: Double {
         speeds.sections(times: playback.frames.times, duration: CMTime(seconds: duration, preferredTimescale: 600)).outputSeconds
     }
     /// The edited section, in frames from 1. The video starts at 1× until the first keyframe.
     private var section: (first: Int, last: Int) {
-        let first = speeds.last(where: { $0.frame <= target })?.frame ?? 0
-        let next = speeds.first(where: { $0.frame > target })?.frame ?? playback.frameCount
-        return (first + 1, max(first + 1, next))
+        (target.first + 1, max(target.first + 1, target.next ?? playback.frameCount))
     }
-    private var canSplit: Bool { frame > 0 && !speeds.contains { $0.frame == frame } }
     /// 1× until a section plays at another speed. Then the length before and after.
     private var summary: String {
-        guard speeds.contains(where: { $0.speed != 1 }) else { return "1×" }
+        guard speeds.contains(where: { $0.pace != .speed(1) }) else { return "1×" }
         return "\(duration.formatted(CropFormatting.seconds)) → \(outputSeconds.formatted(CropFormatting.seconds)) s"
     }
     
@@ -1633,12 +1629,12 @@ struct SpeedInspectorSection: View {
                     .monospacedDigit()
                     .help(history.selectedSpeedIndex == nil ? "The section under the playhead" : "The selected keyframe's section")
                 Spacer()
-                Button("Split at Current Frame", systemImage: "scissors") { history.splitSpeed(at: frame) }
+                Button("Split at Current Frame", systemImage: "scissors") { history.splitSpeed(at: playback.selectedFrame) }
                     .labelStyle(.iconOnly)
-                    .disabled(!canSplit)
+                    .disabled(!target.canSplit)
                     .help("Split at current frame")
-                Picker("Section speed", selection: speedBinding) {
-                    ForEach(SpeedChange.steps, id: \.self) { Text(Self.label($0)).tag($0) }
+                Picker("Section speed", selection: $history.targetPace) {
+                    Self.paceOptions
                 }
                 .labelsHidden()
                 .fixedSize()
@@ -1648,14 +1644,18 @@ struct SpeedInspectorSection: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
     
-    private var speedBinding: Binding<Double> {
-        Binding(
-            get: { speeds.speed(at: target) },
-            set: { history.speeds = speeds.settingSpeed($0, forSectionAt: target) })
+    /// The speeds, then Skip below a divider. Shared by the inspector and the Speed menu.
+    @ViewBuilder static var paceOptions: some View {
+        ForEach(SpeedChange.steps, id: \.self) { Text(label(.speed($0))).tag(SpeedChange.Pace.speed($0)) }
+        Divider()
+        Text(label(.skip)).tag(SpeedChange.Pace.skip)
     }
     
-    static func label(_ speed: Double) -> String {
-        "\(speed.formatted(.number.precision(.fractionLength(0...1)).locale(CropFormatting.locale)))×"
+    static func label(_ pace: SpeedChange.Pace) -> String {
+        switch pace {
+        case .speed(let speed): "\(speed.formatted(.number.precision(.fractionLength(0...1)).locale(CropFormatting.locale)))×"
+        case .skip: String(localized: "Skip")
+        }
     }
 }
 
@@ -1902,7 +1902,7 @@ final class EditHistory {
     var value: CropEdit {
         CropEdit(
             crop: currentCrop,
-            encoding: EncodingSettings(codec: currentCodec, megabitsPerSecond: currentBitrate, container: currentContainer, outputWidth: currentOutputWidth),
+            encoding: encoding,
             imageEncoding: currentImageEncoding, exportsFrame: currentExportsFrame, speeds: currentSpeeds)
     }
     var exportsFrame: Bool { currentExportsFrame }
@@ -1932,20 +1932,22 @@ final class EditHistory {
         }
     }
     private var transaction: CropEdit?
-    private(set) var revision = 0
     @ObservationIgnored let manager = UndoManager()
     
     init() {
         manager.groupsByEvent = false
     }
     
-    var canUndo: Bool {
-        _ = revision
-        return manager.canUndo || (transaction != nil && transaction != value)
+    /// Stored, so views only update when undo or redo becomes available or unavailable, not on every edit.
+    private(set) var canUndo = false
+    private(set) var canRedo = false
+    private func refreshUndoState() {
+        canUndo = manager.canUndo || (transaction != nil && transaction != value)
+        canRedo = manager.canRedo
     }
-    var canRedo: Bool {
-        _ = revision
-        return manager.canRedo
+    /// The encoding part of the edit. Views read this instead of `value`, so they don't track the crop or speeds.
+    var encoding: EncodingSettings {
+        EncodingSettings(codec: currentCodec, megabitsPerSecond: currentBitrate, container: currentContainer, outputWidth: currentOutputWidth)
     }
     var crop: CropMargins {
         get { currentCrop }
@@ -1998,7 +2000,9 @@ final class EditHistory {
         }
     }
     /// The selected speed keyframe, by index. Shared by the timeline, inspector and menu. Not part of undo.
-    var selectedSpeedChange: Int?
+    var selectedSpeedChange: Int? {
+        didSet { refreshSpeedTarget() }
+    }
     /// The selection, if it still names a keyframe after an undo.
     var selectedSpeedIndex: Int? { selectedSpeedChange.flatMap { currentSpeeds.indices.contains($0) ? $0 : nil } }
     /// Adds a keyframe and selects it.
@@ -2006,8 +2010,38 @@ final class EditHistory {
         speeds = speeds.splitting(at: frame)
         selectedSpeedChange = speeds.firstIndex { $0.frame == frame }
     }
-    /// Where speed edits apply: the selected keyframe's section, or else the section under the playhead.
-    func speedTarget(playhead: Int) -> Int { selectedSpeedIndex.map { currentSpeeds[$0].frame } ?? playhead }
+    
+    /// The section speed edits apply to, as the inspector and Speed menu show it.
+    struct SpeedTarget: Equatable {
+        /// The section's first frame, and the next section's. Nil when it runs to the end.
+        var first = 0
+        var next: Int?
+        var pace = SpeedChange.Pace.speed(1)
+        /// The playhead can start a new section: it's past the start and not on a keyframe.
+        var canSplit = false
+    }
+    /// The selected keyframe's section, or else the one under the playhead.
+    /// Stored, so views update when the playhead crosses a keyframe, not on every frame.
+    private(set) var speedTarget = SpeedTarget()
+    @ObservationIgnored private var playhead = 0
+    /// Playback reports each playhead move here.
+    func playheadMoved(to frame: Int) {
+        playhead = frame
+        refreshSpeedTarget()
+    }
+    private func refreshSpeedTarget() {
+        let anchor = selectedSpeedIndex.map { currentSpeeds[$0].frame } ?? playhead
+        speedTarget = SpeedTarget(
+            first: currentSpeeds.last { $0.frame <= anchor }?.frame ?? 0,
+            next: currentSpeeds.first { $0.frame > anchor }?.frame,
+            pace: currentSpeeds.pace(at: anchor),
+            canSplit: playhead > 0 && !currentSpeeds.contains { $0.frame == playhead })
+    }
+    /// The target section's pace, for pickers.
+    var targetPace: SpeedChange.Pace {
+        get { speedTarget.pace }
+        set { speeds = speeds.settingPace(newValue, forSectionAt: speedTarget.first) }
+    }
     /// Resize around the same center until the crop is moved or its margins are edited.
     func resizeCrop(width: Int, height: Int, in size: CGSize) {
         let rectangle = crop.rectangle(in: size)
@@ -2022,18 +2056,20 @@ final class EditHistory {
         transaction = nil
         manager.removeAllActions()
         apply(edit)
-        revision += 1
+        refreshUndoState()
     }
     /// Treat a whole drag or field edit as one undo step.
     func begin() { if transaction == nil { transaction = value } }
     func end() {
         if let transaction, transaction != value { register(transaction) }
         transaction = nil
+        refreshUndoState()
     }
     func set(_ edit: CropEdit) {
         guard edit != value else { return }
         if transaction == nil { register(value) }
         apply(edit)
+        refreshUndoState()
     }
     /// Restore the crop and export settings for this undo step.
     private func apply(_ edit: CropEdit) {
@@ -2046,6 +2082,7 @@ final class EditHistory {
         currentImageEncoding = edit.imageEncoding
         currentExportsFrame = edit.exportsFrame
         currentSpeeds = edit.speeds
+        refreshSpeedTarget()
     }
     private func register(_ previous: CropEdit) {
         let grouping = !manager.isUndoing && !manager.isRedoing
@@ -2053,21 +2090,21 @@ final class EditHistory {
         manager.registerUndo(withTarget: self) { target in
             target.register(target.value)
             target.apply(previous)
-            target.revision += 1
+            target.refreshUndoState()
         }
         manager.setActionName(String(localized: "Crop and Encoding"))
         if grouping { manager.endUndoGrouping() }
-        revision += 1
+        refreshUndoState()
     }
     func undo() {
         end()
         if manager.canUndo { manager.undo() }
-        revision += 1
+        refreshUndoState()
     }
     func redo() {
         end()
         if manager.canRedo { manager.redo() }
-        revision += 1
+        refreshUndoState()
     }
     
 }
@@ -2521,17 +2558,28 @@ enum VideoFrameExporter {
 @MainActor @Observable
 final class PlaybackState {
     private(set) var position = 0.0
-    private(set) var selectedFrame = 0
+    /// The playhead. Each move is reported to the edits, which keep the speed target.
+    private(set) var selectedFrame = 0 {
+        didSet { if selectedFrame != oldValue { playheadMoved() } }
+    }
+    /// Stored, so the step buttons update only at the ends, not on every frame.
+    private(set) var isAtStart = true
+    private(set) var isAtEnd = true
     private(set) var isPlaying = false
     private(set) var isMuted = false
     /// Start again from the beginning at the end. Remembered between launches.
     var loops = UserDefaults.standard.bool(forKey: "PlaybackLoops") {
         didSet { UserDefaults.standard.set(loops, forKey: "PlaybackLoops") }
     }
+    /// Move the playhead with a speed keyframe dragged or nudged with the arrow keys. On by default. Remembered between launches.
+    var followsMovedKeyframe = UserDefaults.standard.object(forKey: "FollowsMovedKeyframe") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(followsMovedKeyframe, forKey: "FollowsMovedKeyframe") }
+    }
     private(set) var duration = 0.0
     private(set) var frames = VideoFrameIndex(times: [])
-    /// The export speeds. Playback follows them.
-    var speeds: [SpeedChange] = []
+    /// The edits whose speeds and skips playback follows. Read when needed, so views don't track them.
+    @ObservationIgnored private weak var history: EditHistory?
+    private var speeds: [SpeedChange] { history?.speeds ?? [] }
     @ObservationIgnored private var player: AVPlayer?
     @ObservationIgnored private var timeObserver: Any?
     @ObservationIgnored private var rateObserver: NSKeyValueObservation?
@@ -2558,11 +2606,13 @@ final class PlaybackState {
         }
     }
     
-    func connect(to player: AVPlayer, frames: VideoFrameIndex, duration: Double) {
+    func connect(to player: AVPlayer, frames: VideoFrameIndex, duration: Double, history: EditHistory) {
         disconnect()
         self.player = player
+        self.history = history
         self.frames = frames
         self.duration = duration
+        playheadMoved()
         updatePosition(player.currentTime())
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 60), queue: .main) { [weak self] time in
             MainActor.assumeIsolated {
@@ -2593,24 +2643,48 @@ final class PlaybackState {
         ) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                let endedBackward = self.heldDirection == -1
-                if self.loops && !endedBackward {
-                    self.seek(to: 0, rate: 1)
-                    return
+                if self.heldDirection == -1 {
+                    self.pause()
+                    self.position = 0
+                    self.selectedFrame = 0
+                } else {
+                    self.playFromStartOrStop()
                 }
-                self.pause()
-                self.reachedEnd = !endedBackward
-                self.position = endedBackward ? 0 : self.duration
-                self.selectedFrame = endedBackward ? 0 : max(0, self.frameCount - 1)
             }
         }
     }
     
-    /// While playing, play each section at its export speed.
+    private func playheadMoved() {
+        isAtStart = selectedFrame == 0
+        isAtEnd = selectedFrame >= frameCount - 1
+        history?.playheadMoved(to: selectedFrame)
+    }
+    
+    /// While playing, play each section at its export speed, and jump over skipped ones.
     private func followSpeed() {
         guard let player, player.rate > 0 else { return }
-        let speed = Float(speeds.speed(at: selectedFrame))
-        if player.rate != speed { player.rate = speed }
+        switch speeds.pace(at: selectedFrame) {
+        case .speed(let speed):
+            if player.rate != Float(speed) { player.rate = Float(speed) }
+        case .skip:
+            if let next = speeds.playedFrame(from: selectedFrame) {
+                seek(to: next, rate: 1)
+            } else {
+                playFromStartOrStop()
+            }
+        }
+    }
+    
+    /// At the end: loop from the first played frame, or stop on the last frame.
+    private func playFromStartOrStop() {
+        if loops, let first = speeds.playedFrame(from: 0) {
+            seek(to: first, rate: 1)
+            return
+        }
+        pause()
+        reachedEnd = true
+        position = duration
+        selectedFrame = max(0, frameCount - 1)
     }
     
     /// Silence the canvas video while checking the crop.
@@ -2642,7 +2716,12 @@ final class PlaybackState {
         if isPlaying {
             pause()
         } else {
-            seek(to: reachedEnd ? 0 : selectedFrame, rate: 1)
+            /// Start on a played frame, so a skipped section never shows.
+            if let frame = speeds.playedFrame(from: reachedEnd ? 0 : selectedFrame) {
+                seek(to: frame, rate: 1)
+            } else {
+                playFromStartOrStop()
+            }
         }
     }
     
@@ -2801,19 +2880,23 @@ final class PlaybackState {
 }
 
 /// Reserve room for the full frame count.
+/// The frame number. The only part of the playback bar that reads the playhead, so only it updates on every frame.
 struct PlaybackReadout: View {
-    let text: String
-    let reservation: String
+    let playback: PlaybackState
     
     var body: some View {
-        Text(verbatim: reservation)
+        let total = playback.frameCount
+        /// The widest text holds the space, so the timeline never resizes.
+        Text(verbatim: "\(total)/\(total)")
             .hidden()
             .overlay(alignment: .trailing) {
-                Text(verbatim: text)
+                Text(verbatim: "\(playback.selectedFrame + 1)/\(total)")
             }
             .font(.caption)
             .monospacedDigit()
             .fixedSize()
+            .accessibilityLabel("Frame \(playback.selectedFrame + 1) of \(total)")
+            .help("\(playback.position.formatted(CropFormatting.seconds)) / \(playback.duration.formatted(CropFormatting.seconds)) s")
     }
 }
 
@@ -2823,14 +2906,10 @@ struct PlaybackControls: View {
     let history: EditHistory
     
     var body: some View {
-        let totalFrames = String(playback.frameCount)
-        let totalSeconds = playback.duration.formatted(CropFormatting.seconds)
-        let currentSeconds = playback.position.formatted(CropFormatting.seconds)
-        
         HStack(spacing: 8) {
             HStack(spacing: 4) {
                 FramePlaybackButton(playback: playback, direction: -1)
-                    .disabled(playback.selectedFrame == 0)
+                    .disabled(playback.isAtStart)
                     .help("Previous frame ([)")
                 Button(action: playback.togglePlayback) {
                     Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
@@ -2839,16 +2918,14 @@ struct PlaybackControls: View {
                 .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
                 .help(playback.isPlaying ? "Pause (Space)" : "Play (Space)")
                 FramePlaybackButton(playback: playback, direction: 1)
-                    .disabled(playback.selectedFrame >= playback.frameCount - 1)
+                    .disabled(playback.isAtEnd)
                     .help("Next frame (])")
             }
             /// The track lines up with the buttons. The handle space below hangs under it.
             PlaybackTimeline(playback: playback, history: history)
-                .alignmentGuide(VerticalAlignment.center) { ($0.height - FrameTimelineView.handleSpace) / 2 }
+                .alignmentGuide(VerticalAlignment.center) { $0.height - FrameTimelineSlider.handleReach }
                 .disabled(playback.frameCount < 2)
-            PlaybackReadout(text: "\(playback.selectedFrame + 1)/\(totalFrames)", reservation: "\(totalFrames)/\(totalFrames)")
-                .accessibilityLabel("Frame \(playback.selectedFrame + 1) of \(playback.frameCount)")
-                .help("\(currentSeconds) / \(totalSeconds) s")
+            PlaybackReadout(playback: playback)
             /// Both speaker icons use the same space so muting cannot resize the timeline.
             Button(action: playback.toggleMute) {
                 Image(systemName: playback.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
@@ -2883,7 +2960,7 @@ struct PlaybackTimeline: NSViewRepresentable {
         let maximum = Double(max(1, playback.frameCount - 1))
         if slider.maxValue != maximum {
             slider.maxValue = maximum
-            slider.redraw()
+            slider.keyframesChanged()
         }
         slider.updatePosition()
         if slider.isEnabled != isEnabled {
@@ -2893,9 +2970,9 @@ struct PlaybackTimeline: NSViewRepresentable {
         slider.updateTimeBubble()
     }
     
-    /// The slider's height plus the handle space below it.
+    /// Tall enough for the handles' click areas below the track, which sits in the slider's middle.
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: FrameTimelineView, context: Context) -> CGSize? {
-        CGSize(width: proposal.width ?? 160, height: nsView.slider.intrinsicContentSize.height + FrameTimelineView.handleSpace)
+        CGSize(width: proposal.width ?? 160, height: nsView.slider.intrinsicContentSize.height / 2 + FrameTimelineSlider.handleReach)
     }
     
     static func dismantleNSView(_ view: FrameTimelineView, coordinator: ()) {
@@ -2906,7 +2983,6 @@ struct PlaybackTimeline: NSViewRepresentable {
 /// Holds the slider at its natural height, at the top, with room below for the keyframe handles.
 /// Left clicks on the track or thumb scrub, and on a handle grab the keyframe. Right-clicks anywhere open the speed menu.
 final class FrameTimelineView: NSView {
-    static let handleSpace: CGFloat = 10
     let slider = FrameTimelineSlider()
     private let keyframes = FrameTimelineKeyframes()
     
@@ -2963,7 +3039,7 @@ final class FrameTimelineView: NSView {
     override func resetCursorRects() {
         removeAllToolTips()
         for bar in slider.keyframeBars() {
-            let rect = convert(bar.handle.insetBy(dx: -3, dy: -3), from: slider)
+            let rect = convert(bar.handle.insetBy(dx: -FrameTimelineSlider.handleHitMargin, dy: -FrameTimelineSlider.handleHitMargin), from: slider)
             addCursorRect(rect, cursor: .openHand)
             addToolTip(rect, owner: String(localized: "Drag to move. Hold Option for finer steps.") as NSString, userData: nil)
         }
@@ -3009,18 +3085,35 @@ final class FrameTimelineCell: NSSliderCell {
 final class FrameTimelineSlider: NSSlider {
     weak var playback: PlaybackState?
     weak var history: EditHistory?
+    /// The model's keyframes. Cursor areas follow them.
     var speeds: [SpeedChange] = [] {
-        didSet { if speeds != oldValue { redraw() } }
+        didSet { if speeds != oldValue { keyframesChanged() } }
     }
     weak var keyframeLayer: NSView?
     fileprivate(set) var selectedKeyframe: Int? {
         didSet { if selectedKeyframe != oldValue { redraw() } }
     }
-    private let trackHeight: CGFloat = 12
+    /// The handle geometry. The timeline view's height comes from it, so every handle's click area fits inside.
+    static let trackHeight: CGFloat = 12
+    static let handleGap: CGFloat = 4
+    static let handleRadius: CGFloat = 4.5
+    static let handleHitMargin: CGFloat = 3
+    /// From the track's center to the bottom of a handle's click area.
+    static let handleReach = trackHeight / 2 + handleGap + handleRadius * 2 + handleHitMargin
+    private var trackHeight: CGFloat { Self.trackHeight }
     private var scrubbing = false
     private var hovering = false
-    /// The keyframe being dragged, for the time bubble.
-    private var draggedKeyframe: Int?
+    /// The keyframe being dragged and its frame now. Like the native thumb, a drag changes only the timeline until release.
+    private var drag: (index: Int, frame: Int)? {
+        didSet { redraw() }
+    }
+    /// The keyframes as drawn: the model's, with a dragged keyframe where it is now.
+    private var shownSpeeds: [SpeedChange] {
+        guard let drag, speeds.indices.contains(drag.index) else { return speeds }
+        var shown = speeds
+        shown[drag.index].frame = drag.frame
+        return shown
+    }
     private var hoverArea: NSTrackingArea?
     private var resignObserver: NSObjectProtocol?
     private let timeBubble = NSPanel(
@@ -3201,7 +3294,7 @@ final class FrameTimelineSlider: NSSlider {
     /// The bubble shows one time: a dragged keyframe first, then the hover preview, then the thumb while hovering or scrubbing.
     private var bubbleSubject: (seconds: Double, anchor: NSRect)? {
         guard isEnabled, let playback else { return nil }
-        let keyframe = draggedKeyframe.flatMap { speeds.indices.contains($0) ? speeds[$0].frame : nil } ?? phantomFrame
+        let keyframe = drag?.frame ?? phantomFrame
         if let keyframe, playback.frames.times.indices.contains(keyframe) {
             let x = x(forValue: Double(keyframe))
             return (playback.frames.times[keyframe].seconds, NSRect(x: x - 1, y: bounds.minY, width: 2, height: bounds.height))
@@ -3231,6 +3324,7 @@ final class FrameTimelineSlider: NSSlider {
     }
     
     private func hideTimeBubble() {
+        guard timeBubble.isVisible || timeBubble.parent != nil else { return }
         timeBubble.orderOut(nil)
         timeBubble.parent?.removeChildWindow(timeBubble)
     }
@@ -3250,9 +3344,10 @@ final class FrameTimelineSlider: NSSlider {
         return Int((min(1, max(0, (x - travel.minX) / max(1, travel.width))) * maxValue).rounded())
     }
     
-    /// The track: one colored section per speed, the played part solid, and a bar at each keyframe.
-    /// Each speed step is one step from blue toward red.
-    static func color(for speed: Double) -> NSColor {
+    /// The track: one colored section per pace, the played part solid, and a bar at each keyframe.
+    /// Each speed step is one step from blue toward red. Skipped sections are gray.
+    static func color(for pace: SpeedChange.Pace) -> NSColor {
+        guard case .speed(let speed) = pace else { return .systemGray }
         let steps = SpeedChange.steps
         let index = steps.firstIndex { $0 >= speed } ?? steps.count - 1
         let blue = NSColor.systemBlue.usingColorSpace(.sRGB) ?? .systemBlue
@@ -3265,7 +3360,8 @@ final class FrameTimelineSlider: NSSlider {
         let start = x(forValue: 0)
         let track = NSRect(x: start, y: midY - trackHeight / 2, width: x(forValue: maxValue) - start, height: trackHeight)
         /// The video plays at 1× until the first keyframe.
-        let starts: [SpeedChange] = speeds.first?.frame == 0 ? speeds : [SpeedChange(frame: 0, speed: 1)] + speeds
+        let shown = shownSpeeds
+        let starts: [SpeedChange] = shown.first?.frame == 0 ? shown : [SpeedChange(frame: 0, pace: .speed(1))] + shown
         let edges = starts.indices.map { index in
             (left: index == 0 ? track.minX : x(forValue: Double(starts[index].frame)),
              right: index + 1 < starts.count ? x(forValue: Double(starts[index + 1].frame)) : track.maxX)
@@ -3277,7 +3373,7 @@ final class FrameTimelineSlider: NSSlider {
         NSGraphicsContext.saveGraphicsState()
         NSBezierPath(roundedRect: track, xRadius: 3, yRadius: 3).addClip()
         for (index, start) in starts.enumerated() {
-            let color = Self.color(for: start.speed)
+            let color = Self.color(for: start.pace)
             let section = NSRect(x: edges[index].left, y: track.minY, width: edges[index].right - edges[index].left, height: track.height)
             color.withAlphaComponent(0.25).setFill()
             section.fill()
@@ -3290,7 +3386,7 @@ final class FrameTimelineSlider: NSSlider {
         for (index, start) in starts.enumerated() where edges[index].right - edges[index].left > 30 {
             let center = (edges[index].left + edges[index].right) / 2
             let label = NSAttributedString(
-                string: SpeedInspectorSection.label(start.speed),
+                string: SpeedInspectorSection.label(start.pace),
                 attributes: [
                     .font: NSFont.systemFont(ofSize: 9, weight: .semibold),
                     .foregroundColor: center < playhead ? NSColor.white : NSColor.secondaryLabelColor,
@@ -3323,6 +3419,11 @@ final class FrameTimelineSlider: NSSlider {
     func redraw() {
         needsDisplay = true
         keyframeLayer?.needsDisplay = true
+    }
+    
+    /// Redraw, and move the open-hand areas and tooltips to the keyframes' new places.
+    func keyframesChanged() {
+        redraw()
         if let container = superview { window?.invalidateCursorRects(for: container) }
     }
     
@@ -3330,7 +3431,7 @@ final class FrameTimelineSlider: NSSlider {
     
     /// A line marks where each keyframe's section starts, with a round handle below the track to grab it. In slider coordinates.
     func keyframeBars() -> [(line: NSRect, handle: NSRect, selected: Bool)] {
-        speeds.enumerated().map { index, keyframe in
+        shownSpeeds.enumerated().map { index, keyframe in
             let shape = keyframeShape(at: keyframe.frame)
             return (shape.line, shape.handle, index == selectedKeyframe)
         }
@@ -3346,9 +3447,9 @@ final class FrameTimelineSlider: NSSlider {
     
     private func keyframeShape(at frame: Int) -> (line: NSRect, handle: NSRect) {
         let down: CGFloat = isFlipped ? 1 : -1
-        let radius: CGFloat = 4.5
+        let radius = Self.handleRadius
         let top = trackMidY - down * (trackHeight / 2 + 2)
-        let handleCenter = trackMidY + down * (trackHeight / 2 + 4 + radius)
+        let handleCenter = trackMidY + down * (trackHeight / 2 + Self.handleGap + radius)
         let x = x(forValue: Double(frame))
         let line = NSRect(x: x - 1, y: min(top, handleCenter), width: 2, height: abs(handleCenter - top))
         let handle = NSRect(x: x - radius, y: handleCenter - radius, width: radius * 2, height: radius * 2)
@@ -3368,25 +3469,33 @@ final class FrameTimelineSlider: NSSlider {
         guard abs(point.y - trackMidY) > trackHeight / 2 else { return nil }
         let bars = keyframeBars()
         return bars.indices
-            .filter { bars[$0].handle.insetBy(dx: -3, dy: -3).contains(point) }
+            .filter { bars[$0].handle.insetBy(dx: -Self.handleHitMargin, dy: -Self.handleHitMargin).contains(point) }
             .min { abs(bars[$0].handle.midX - point.x) < abs(bars[$1].handle.midX - point.x) }
     }
     
     /// Select a keyframe and follow the mouse until release. One drag is one undo step.
     /// Frames snap to whole numbers. Holding Option moves ten times slower.
+    /// With the Speed menu option on, the thumb follows the keyframe like scrubbing, and playback resumes on release.
     private func dragKeyframe(_ index: Int, from event: NSEvent) {
-        guard let history, speeds.indices.contains(index) else { return }
+        guard speeds.indices.contains(index), let frameCount = playback?.frameCount else { return }
+        let follows = playback?.followsMovedKeyframe == true
+        let start = speeds[index].frame
         select(index)
         NSCursor.closedHand.push()
-        draggedKeyframe = index
+        drag = (index, start)
+        if follows {
+            playback?.setScrubbing(true)
+            showFrame(start)
+        }
         updateTimeBubble()
         defer {
             NSCursor.pop()
-            draggedKeyframe = nil
+            if follows { playback?.setScrubbing(false) }
             updateTimeBubble()
         }
-        history.begin()
-        var position = Double(speeds[index].frame)
+        
+        /// Follow the mouse. Only the timeline and the playhead change.
+        var position = Double(start)
         var lastX = convert(event.locationInWindow, from: nil).x
         while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]), next.type == .leftMouseDragged {
             let x = convert(next.locationInWindow, from: nil).x
@@ -3394,17 +3503,38 @@ final class FrameTimelineSlider: NSSlider {
             let pointsPerFrame = (bounds.width - knob) / CGFloat(max(1, maxValue)) * (next.modifierFlags.contains(.option) ? 10 : 1)
             position += Double((x - lastX) / max(0.01, pointsPerFrame))
             lastX = x
-            moveKeyframe(index, to: Int(position.rounded()))
+            let frame = speeds.moving(index, to: Int(position.rounded()), frameCount: frameCount)[index].frame
+            guard frame != drag?.frame else { continue }
+            drag = (index, frame)
+            if follows { showFrame(frame) }
             updateTimeBubble()
         }
-        history.end()
+        
+        /// On release, the model changes once. That is one undo step.
+        if let drag, drag.frame != start { moveKeyframe(index, to: drag.frame) }
+        drag = nil
     }
     
-    /// Move a keyframe between its neighbors. The playhead stays where it is.
+    /// Move a keyframe between its neighbors. The timeline updates right away, before SwiftUI passes the new keyframes back.
     private func moveKeyframe(_ index: Int, to frame: Int) {
         guard let history, let playback else { return }
         let moved = history.speeds.moving(index, to: frame, frameCount: playback.frameCount)
-        if moved != history.speeds { history.speeds = moved }
+        guard moved != history.speeds else { return }
+        history.speeds = moved
+        speeds = moved
+    }
+    
+    /// One frame left or right. With the Speed menu option on, the playhead follows.
+    private func nudgeKeyframe(_ index: Int, by amount: Int) {
+        moveKeyframe(index, to: speeds[index].frame + amount)
+        if playback?.followsMovedKeyframe == true { showFrame(speeds[index].frame) }
+    }
+    
+    /// Put the playhead and thumb on a frame, so the canvas shows it.
+    private func showFrame(_ frame: Int) {
+        guard let playback else { return }
+        playback.framePosition = Double(frame)
+        updatePosition()
     }
     
     /// The section joins the one before it.
@@ -3419,8 +3549,8 @@ final class FrameTimelineSlider: NSSlider {
     func handleKeyframeKey(_ event: NSEvent) -> Bool {
         guard let index = selectedKeyframe, speeds.indices.contains(index) else { return false }
         switch event.keyCode {
-        case 123: moveKeyframe(index, to: speeds[index].frame - 1)
-        case 124: moveKeyframe(index, to: speeds[index].frame + 1)
+        case 123: nudgeKeyframe(index, by: -1)
+        case 124: nudgeKeyframe(index, by: 1)
         case 51, 117: removeKeyframe(index)
         case 53: select(nil)
         default: return false
@@ -3428,7 +3558,7 @@ final class FrameTimelineSlider: NSSlider {
         return true
     }
     
-    /// Right-click sets the speed of the clicked section, and adds or removes a keyframe.
+    /// Right-click sets the speed of the clicked section or skips it, and adds or removes a keyframe.
     override func menu(for event: NSEvent) -> NSMenu? {
         guard isEnabled, history != nil else { return nil }
         let point = convert(event.locationInWindow, from: nil)
@@ -3436,13 +3566,14 @@ final class FrameTimelineSlider: NSSlider {
         let clickedIndex = keyframe(at: point)
         let clickedFrame = clickedIndex.map { speeds[$0].frame } ?? frame(atX: point.x)
         
-        /// One item per speed, with a check on the section's current speed.
-        let current = speeds.speed(at: clickedFrame)
-        for speed in SpeedChange.steps {
-            let item = NSMenuItem(title: SpeedInspectorSection.label(speed), action: #selector(setSpeedFromMenu(_:)), keyEquivalent: "")
-            item.representedObject = (frame: clickedFrame, speed: speed)
+        /// One item per speed, then Skip, with a check on the section's current pace.
+        let current = speeds.pace(at: clickedFrame)
+        for pace in SpeedChange.paces {
+            if pace == .skip { menu.addItem(.separator()) }
+            let item = NSMenuItem(title: SpeedInspectorSection.label(pace), action: #selector(setPaceFromMenu(_:)), keyEquivalent: "")
+            item.representedObject = (frame: clickedFrame, pace: pace)
             item.target = self
-            item.state = speed == current ? .on : .off
+            item.state = pace == current ? .on : .off
             menu.addItem(item)
         }
         menu.addItem(.separator())
@@ -3473,9 +3604,9 @@ final class FrameTimelineSlider: NSSlider {
         removeKeyframe(item.tag)
     }
     
-    @objc private func setSpeedFromMenu(_ item: NSMenuItem) {
-        guard let history, let (frame, speed) = item.representedObject as? (frame: Int, speed: Double) else { return }
-        history.speeds = history.speeds.settingSpeed(speed, forSectionAt: frame)
+    @objc private func setPaceFromMenu(_ item: NSMenuItem) {
+        guard let history, let (frame, pace) = item.representedObject as? (frame: Int, pace: SpeedChange.Pace) else { return }
+        history.speeds = history.speeds.settingPace(pace, forSectionAt: frame)
     }
     
     /// Stop scrubbing and hide the time when leaving the window or closing the video.
@@ -4756,43 +4887,57 @@ enum VideoContainer: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// From this frame until the next change, the video plays at this speed.
+/// From this frame until the next change, the video plays at this pace.
 struct SpeedChange: Equatable, Sendable {
     var frame: Int
-    var speed: Double
+    var pace: Pace
+    
+    /// A section plays at a speed, or is skipped in playback and export.
+    enum Pace: Hashable, Sendable {
+        case speed(Double)
+        case skip
+    }
     
     /// The speeds offered in the inspector.
     static let steps: [Double] = [1, 1.5, 2, 3, 4, 6, 8, 10]
+    /// Every choice in the speed menus: the speeds, then Skip.
+    static let paces: [Pace] = steps.map { .speed($0) } + [.skip]
 }
 
-/// A part of the source video and the speed it is exported at.
+/// A part of the source video and the pace it is exported at.
 struct SpeedSection: Sendable {
     let range: CMTimeRange
-    let speed: Double
+    let pace: SpeedChange.Pace
 }
 
 extension Array where Element == SpeedChange {
-    /// The speed in effect at a frame. The video starts at 1×.
-    func speed(at frame: Int) -> Double {
-        last(where: { $0.frame <= frame })?.speed ?? 1
+    /// The pace in effect at a frame. The video starts at 1×.
+    func pace(at frame: Int) -> SpeedChange.Pace {
+        last(where: { $0.frame <= frame })?.pace ?? .speed(1)
     }
     
-    /// Set the speed of the section that contains this frame.
-    func settingSpeed(_ speed: Double, forSectionAt frame: Int) -> [SpeedChange] {
+    /// Set the pace of the section that contains this frame.
+    func settingPace(_ pace: SpeedChange.Pace, forSectionAt frame: Int) -> [SpeedChange] {
         var changes = self
         if let index = changes.lastIndex(where: { $0.frame <= frame }) {
-            changes[index].speed = speed
+            changes[index].pace = pace
         } else {
-            changes.insert(SpeedChange(frame: 0, speed: speed), at: 0)
+            changes.insert(SpeedChange(frame: 0, pace: pace), at: 0)
         }
         return changes
     }
     
-    /// Start a new section at this frame, at the speed it already plays at.
+    /// The first frame from here on that plays. Nil when the rest is skipped.
+    func playedFrame(from frame: Int) -> Int? {
+        if pace(at: frame) != .skip { return frame }
+        return first(where: { $0.frame > frame && $0.pace != .skip })?.frame
+    }
+    
+    /// Start a new section at this frame, at the pace it already plays at.
     func splitting(at frame: Int) -> [SpeedChange] {
         guard frame > 0, !contains(where: { $0.frame == frame }) else { return self }
         var changes = self
-        changes.append(SpeedChange(frame: frame, speed: speed(at: frame)))
+        changes.append(SpeedChange(frame: frame, pace: pace(at: frame)))
         changes.sort { $0.frame < $1.frame }
         return changes
     }
@@ -4807,29 +4952,34 @@ extension Array where Element == SpeedChange {
         return changes
     }
     
-    /// The source video cut into sections, one per speed, in time.
+    /// The source video cut into sections, one per pace, in time.
     func sections(times: [CMTime], duration: CMTime) -> [SpeedSection] {
         var sections: [SpeedSection] = []
         var start = CMTime.zero
-        var speed = 1.0
+        var pace = SpeedChange.Pace.speed(1)
         for change in self where times.indices.contains(change.frame) {
             let time = change.frame == 0 ? .zero : times[change.frame]
             if CMTimeCompare(time, start) > 0 {
-                sections.append(SpeedSection(range: CMTimeRange(start: start, end: time), speed: speed))
+                sections.append(SpeedSection(range: CMTimeRange(start: start, end: time), pace: pace))
                 start = time
             }
-            speed = change.speed
+            pace = change.pace
         }
         if CMTimeCompare(duration, start) > 0 {
-            sections.append(SpeedSection(range: CMTimeRange(start: start, end: duration), speed: speed))
+            sections.append(SpeedSection(range: CMTimeRange(start: start, end: duration), pace: pace))
         }
         return sections
     }
 }
 
 extension Array where Element == SpeedSection {
-    /// The exported length in seconds.
-    var outputSeconds: Double { reduce(0) { $0 + $1.range.duration.seconds / $1.speed } }
+    /// The exported length in seconds. Skipped sections add nothing.
+    var outputSeconds: Double {
+        reduce(0) { total, section in
+            guard case .speed(let speed) = section.pace else { return total }
+            return total + section.range.duration.seconds / speed
+        }
+    }
 }
 
 /// The video’s color information, including whether it uses HDR.
@@ -4895,12 +5045,12 @@ enum VideoExporter {
         }
         let duration = try await asset.load(.duration)
         
-        /// Speed changes play each section faster in a composition. Without them, read the file directly.
+        /// Speed changes and skips are built in a composition. Without them, read the file directly.
         var reading: AVAsset = asset
         var videoTrack = geometry.track
         var audioTracks = try await asset.loadTracks(withMediaType: .audio)
         var outputDuration = duration
-        let speeding = speedSections.contains { $0.speed != 1 }
+        let speeding = speedSections.contains { $0.pace != .speed(1) }
         if speeding {
             let composition = AVMutableComposition()
             guard let compositionVideo = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
@@ -4915,10 +5065,18 @@ enum VideoExporter {
                 try added.insertTimeRange(range, of: track, at: range.start)
                 compositionAudio.append(added)
             }
-            /// Scale from the end, so the sections before keep their times.
-            for section in speedSections.reversed() where section.speed != 1 {
-                composition.scaleTimeRange(section.range, toDuration: CMTimeMultiplyByFloat64(section.range.duration, multiplier: 1 / section.speed))
+            /// Edit from the end, so the sections before keep their times.
+            for section in speedSections.reversed() {
+                switch section.pace {
+                case .skip:
+                    composition.removeTimeRange(section.range)
+                case .speed(let speed) where speed != 1:
+                    composition.scaleTimeRange(section.range, toDuration: CMTimeMultiplyByFloat64(section.range.duration, multiplier: 1 / speed))
+                case .speed:
+                    break
+                }
             }
+            guard composition.duration > .zero else { throw failure("Every section is skipped.") }
             reading = composition
             videoTrack = compositionVideo
             audioTracks = compositionAudio

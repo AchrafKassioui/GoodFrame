@@ -23,6 +23,12 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 
 ## Change Log
 
+### 1.7
+
+- Cut a section in a video with the `Skip` option. Skipped sections don't play or export.
+- When a keyframe is dragged, the playhead follows it. Turn it off in the Speed menu.
+- UI performance improvements.
+
 ### 1.6
 
 - Improved UI for speed change.
