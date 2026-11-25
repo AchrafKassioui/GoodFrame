@@ -23,6 +23,10 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 
 ## Change Log
 
+### 1.7.3
+
+- A resize cursor is now maintained until the drag ends.
+
 ### 1.7.2
 
 - Resize images and exported video frames, like videos. Image resizing uses smooth bilinear averaging.

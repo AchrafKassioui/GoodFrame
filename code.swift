@@ -4249,12 +4249,13 @@ final class VideoCanvasView: NSView {
     }
     let overlay = CropOverlayView()
     private let videoSurface = NSView()
-    private let fillLayer = CALayer()
+    /// The export background, only where the crop extends past the media.
+    private let fillLayer = CAShapeLayer()
     var exportFill: NSColor? {
         didSet {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            fillLayer.backgroundColor = exportFill?.cgColor
+            fillLayer.fillColor = exportFill?.cgColor
             CATransaction.commit()
         }
     }
@@ -4268,6 +4269,7 @@ final class VideoCanvasView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        fillLayer.fillRule = .evenOdd
         layer?.addSublayer(fillLayer)
         videoSurface.wantsLayer = true
         videoLayer.videoGravity = .resize
@@ -4291,8 +4293,24 @@ final class VideoCanvasView: NSView {
     func positionVideo(in imageFrame: CGRect, retained: CGRect, scale: CGFloat) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        /// Show the export background inside the framing rectangle.
-        fillLayer.frame = CGRect(x: imageFrame.minX + retained.minX * scale, y: imageFrame.minY + retained.minY * scale, width: retained.width * scale, height: retained.height * scale)
+        /// Show the export background inside the framing rectangle, but not under the media.
+        /// Both share the crop's edges, which fall between screen pixels, so a fill underneath would show through as a light outline.
+        /// On padded sides, the hole stops a point inside the media's edge, so no gap opens where they meet.
+        /// On other sides it reaches the crop's edge, so nothing is left under the media.
+        let cropFrame = CGRect(x: imageFrame.minX + retained.minX * scale, y: imageFrame.minY + retained.minY * scale, width: retained.width * scale, height: retained.height * scale)
+        fillLayer.frame = cropFrame
+        let fillBounds = CGRect(origin: .zero, size: cropFrame.size)
+        let media = imageFrame.offsetBy(dx: -cropFrame.minX, dy: -cropFrame.minY)
+        let left = media.minX > 0 ? media.minX + 1 : 0
+        let top = media.minY > 0 ? media.minY + 1 : 0
+        let right = media.maxX < fillBounds.maxX ? media.maxX - 1 : fillBounds.maxX
+        let bottom = media.maxY < fillBounds.maxY ? media.maxY - 1 : fillBounds.maxY
+        let fillPath = CGMutablePath()
+        fillPath.addRect(fillBounds)
+        if right > left, bottom > top {
+            fillPath.addRect(CGRect(x: left, y: top, width: right - left, height: bottom - top))
+        }
+        fillLayer.path = fillPath
         videoSurface.frame = imageFrame
         mediaLayer.frame = videoSurface.bounds
         videoLayer.frame = mediaLayer.bounds
@@ -4432,6 +4450,8 @@ final class CropOverlayView: NSView {
     private var dragCrop = CropMargins()
     private var activeHandle: Handle?
     private var moving = false
+    /// The cursor the drag started with. It stays until release, even when the pointer gets ahead of the edge.
+    private var dragCursor: NSCursor?
     var editingEnabled = true
     var history: EditHistory?
     private var fields: [CropMargins.Edge: NSHostingView<CropCanvasField>] = [:]
@@ -4528,6 +4548,10 @@ final class CropOverlayView: NSView {
     
     override func resetCursorRects() {
         guard editingEnabled, sourceSize.width > 0 else { return }
+        if let dragCursor {
+            addCursorRect(bounds, cursor: dragCursor)
+            return
+        }
         if let scroll = enclosingScrollView as? CanvasScrollView, scroll.handToolHeld || scroll.showingPanCursor {
             addCursorRect(bounds, cursor: scroll.showingPanCursor ? .closedHand : .openHand)
             return
@@ -4557,21 +4581,28 @@ final class CropOverlayView: NSView {
         dragOrigin = convert(event.locationInWindow, from: nil)
         dragCrop = crop
         activeHandle = Handle.allCases.first { handleRect($0).insetBy(dx: -4, dy: -4).contains(dragOrigin) }
+        dragCursor = activeHandle?.cursor
         if activeHandle == nil {
             let rectangle = selection
             if CGRect(x: rectangle.minX, y: rectangle.minY - 6, width: rectangle.width, height: 9).contains(dragOrigin) {
                 activeHandle = .top
+                dragCursor = .resizeUpDown
             } else if CGRect(x: rectangle.minX, y: rectangle.maxY - 3, width: rectangle.width, height: 9).contains(dragOrigin) {
                 activeHandle = .bottom
+                dragCursor = .resizeUpDown
             } else if CGRect(x: rectangle.minX - 6, y: rectangle.minY, width: 9, height: rectangle.height).contains(dragOrigin) {
                 activeHandle = .left
+                dragCursor = .resizeLeftRight
             } else if CGRect(x: rectangle.maxX - 3, y: rectangle.minY, width: 9, height: rectangle.height).contains(dragOrigin) {
                 activeHandle = .right
+                dragCursor = .resizeLeftRight
             }
         }
         moving = activeHandle == nil && selection.contains(dragOrigin)
+        if moving { dragCursor = CropCursors.moveCrop }
         if activeHandle != nil || moving { onEditBegan?() }
-        if moving { CropCursors.moveCrop.set() }
+        dragCursor?.set()
+        window?.invalidateCursorRects(for: self)
     }
     
     /// Convert a drag distance into video pixels to move or resize the crop.
@@ -4617,6 +4648,7 @@ final class CropOverlayView: NSView {
         onEditEnded?()
         activeHandle = nil
         moving = false
+        dragCursor = nil
         window?.invalidateCursorRects(for: self)
     }
     
