@@ -23,6 +23,10 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 
 ## Change Log
 
+### 1.7.2
+
+- Resize images and exported video frames, like videos. Image resizing uses smooth bilinear averaging.
+
 ### 1.7.1
 
 - Export still works after the original file is renamed, moved, or put in the Trash. If the file was permanently deleted, exporting doesn't start and a message says so.

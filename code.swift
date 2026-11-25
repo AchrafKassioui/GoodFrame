@@ -6,7 +6,7 @@
  
  Achraf Kassioui
  Created 20 Oct 2026
- Updated 24 Nov 2026
+ Updated 25 Nov 2026
  
  */
 @preconcurrency import AVFoundation
@@ -736,6 +736,7 @@ struct EditorView: View {
         let exportWindow = NSApp.keyWindow
         let selectedCrop = crop.rectangle(in: sourceSize)
         let selectedSettings = history.imageEncoding
+        let outputSize = history.outputSize(for: selectedCrop.size)
         let openedImage = imageSource
         let frameTime = openedImage == nil ? playback.pauseForExport() : nil
         let frameNumber = openedImage == nil ? playback.selectedFrame + 1 : nil
@@ -765,7 +766,7 @@ struct EditorView: View {
                     throw ImageError.unreadableFrame
                 }
                 try Task.checkCancellation()
-                try ImageExporter.export(source: image, destination: destination, crop: selectedCrop, settings: selectedSettings)
+                try ImageExporter.export(source: image, destination: destination, crop: selectedCrop, outputSize: outputSize, settings: selectedSettings)
                 return image.isHDR
             }
             do {
@@ -778,7 +779,7 @@ struct EditorView: View {
                 let bytes = try destination.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
                 let summary = ExportSummary(
                     codec: selectedSettings.format.rawValue, bitrate: 0, bytes: Int64(bytes), elapsed: Date().timeIntervalSince(started),
-                    isHDR: isHDR, resolution: selectedCrop.size, imageFormat: selectedSettings.format.rawValue)
+                    isHDR: isHDR, resolution: outputSize, imageFormat: selectedSettings.format.rawValue)
                 let suffix = frameNumber.map { "-frame-\($0)" } ?? "-framed"
                 let document = try ExportDocument(
                     exportURL: destination, title: sourceURL.deletingPathExtension().lastPathComponent + suffix,
@@ -813,7 +814,7 @@ struct EditorView: View {
         let selectedFill = history.imageEncoding.background
         let selectedSections = history.speeds.sections(
             times: playback.frames.times, duration: CMTime(seconds: duration, preferredTimescale: 600))
-        let outputSize = selectedSettings.outputSize(for: selectedCrop.size)
+        let outputSize = history.outputSize(for: selectedCrop.size)
         previewOnly = false
         withAnimation { showInspector = true }
         player?.pause()
@@ -837,7 +838,7 @@ struct EditorView: View {
             do {
                 let started = Date()
                 try await VideoExporter.export(
-                    source: sourceURL, destination: destinationURL, crop: selectedCrop, settings: selectedSettings, speedSections: selectedSections, fill: selectedFill,
+                    source: sourceURL, destination: destinationURL, crop: selectedCrop, outputSize: outputSize, settings: selectedSettings, speedSections: selectedSections, fill: selectedFill,
                     fileSize: { bytes in Task { @MainActor in if exportState.operation == operation { exportState.bytes = bytes } } },
                     progress: { value in Task { @MainActor in if exportState.operation == operation { exportState.progress = value } } })
                 try Task.checkCancellation()
@@ -1312,10 +1313,7 @@ struct InspectorView: View {
     private var outputHeight: Int { Int(sourceSize.height) - crop.top - crop.bottom }
     private var originalBitrate: Double { sourceMbps.isFinite && sourceMbps > 0 ? sourceMbps : 2.5 }
     /// The exported video size: the crop, resized when an output width is set.
-    private var exportSize: CGSize {
-        guard imageSource == nil, !history.exportsFrame else { return CGSize(width: outputWidth, height: outputHeight) }
-        return history.encoding.outputSize(for: CGSize(width: outputWidth, height: outputHeight))
-    }
+    private var exportSize: CGSize { history.outputSize(for: CGSize(width: outputWidth, height: outputHeight)) }
     
     /// Arrange the inspector controls in sections.
     var body: some View {
@@ -1383,7 +1381,9 @@ struct InspectorView: View {
                     }
                     .disabled(!loaded || busy)
                     if let imageSource {
-                        ImageEncodingSection(history: history, hasTransparency: imageSource.hasTransparency || crop.addsPadding)
+                        ImageEncodingSection(
+                            history: history, hasTransparency: imageSource.hasTransparency || crop.addsPadding,
+                            cropSize: CGSize(width: outputWidth, height: outputHeight), loaded: loaded)
                             .disabled(busy)
                     } else {
                         CropEncodingSection(
@@ -1548,7 +1548,6 @@ struct CropEncodingSection: View {
     let isHDR: Bool
     let hasTransparency: Bool
     let cropSize: CGSize
-    private var outputSize: CGSize { history.encoding.outputSize(for: cropSize) }
     
     var body: some View {
         CropInspectorSection("Encoding") {
@@ -1570,20 +1569,8 @@ struct CropEncodingSection: View {
                     .fixedSize()
                     .help("MP4 plays everywhere on the web. MOV keeps Apple metadata such as Retina sizing.")
                 }
-                /// The output keeps the crop's proportions: set one side, the other follows.
-                HStack(spacing: 6) {
-                    Text("Output Size")
-                    Spacer()
-                    CropDimensionField(value: outputSide(horizontal: true), maximum: CropMargins.maximumDimension, label: "Output width", history: history, showsPlaceholder: !loaded)
-                        .frame(width: 64, height: 22)
-                    Text("×")
-                        .foregroundStyle(.secondary)
-                    CropDimensionField(value: outputSide(horizontal: false), maximum: CropMargins.maximumDimension, label: "Output height", history: history, showsPlaceholder: !loaded)
-                        .frame(width: 64, height: 22)
-                    CropResetButton("Match Crop Size") { history.outputWidth = nil }
-                }
-                .help("Output size in pixels")
             }
+            OutputSizeRow(history: history, cropSize: cropSize, loaded: loaded)
             if history.exportsFrame {
                 ImageQualityControls(history: history, hasTransparency: hasTransparency)
             } else {
@@ -1605,15 +1592,39 @@ struct CropEncodingSection: View {
         }
         .disabled(!loaded || busy)
     }
+}
+
+/// The exported size, for videos, frames, and images. It keeps the crop's proportions: set one side, the other follows.
+struct OutputSizeRow: View {
+    let history: EditHistory
+    let cropSize: CGSize
+    let loaded: Bool
+    private var outputSize: CGSize { history.outputSize(for: cropSize) }
     
-    /// A side of the output size. Setting either side sets the output width.
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("Output Size")
+            Spacer()
+            CropDimensionField(value: outputSide(horizontal: true), maximum: CropMargins.maximumDimension, label: "Output width", history: history, showsPlaceholder: !loaded)
+                .frame(width: 64, height: 22)
+            Text("×")
+                .foregroundStyle(.secondary)
+            CropDimensionField(value: outputSide(horizontal: false), maximum: CropMargins.maximumDimension, label: "Output height", history: history, showsPlaceholder: !loaded)
+                .frame(width: 64, height: 22)
+            CropResetButton("Match Crop Size") { history.outputWidth = nil }
+        }
+        .help("Output size in pixels")
+    }
+    
+    /// A side of the output size. Setting either side sets the output width, in the pixel step of the media.
     private func outputSide(horizontal: Bool) -> Binding<Int> {
         Binding(
             get: { Int(horizontal ? outputSize.width : outputSize.height) },
             set: { requested in
                 guard cropSize.width > 0, cropSize.height > 0 else { return }
-                let width = horizontal ? requested : Int((Double(requested) * cropSize.width / cropSize.height / 2).rounded()) * 2
-                history.outputWidth = width == Int(cropSize.width) ? nil : max(2, width)
+                let step = history.pixelStep
+                let width = horizontal ? requested : Int((Double(requested) * cropSize.width / cropSize.height / Double(step)).rounded()) * step
+                history.outputWidth = width == Int(cropSize.width) ? nil : max(step, width)
             })
     }
 }
@@ -1916,6 +1927,18 @@ struct CropEdit: Equatable {
     var imageEncoding = ImageEncodingSettings()
     var exportsFrame = false
     var speeds: [SpeedChange] = []
+    /// The exported width, for videos, frames, and images. Nil exports the crop at its own size.
+    var outputWidth: Int? = nil
+}
+
+extension CGSize {
+    /// This crop size at an output width, keeping its proportions, in whole steps of pixels. Videos use steps of 2.
+    func scaled(toWidth outputWidth: Int?, step: Int) -> CGSize {
+        guard let outputWidth, width > 0, height > 0 else { return self }
+        let scaledWidth = max(step, outputWidth / step * step)
+        let scaledHeight = max(step, Int((Double(scaledWidth) * height / width / Double(step)).rounded()) * step)
+        return CGSize(width: scaledWidth, height: scaledHeight)
+    }
 }
 
 /// Stores crop and encoding changes so they can be undone.
@@ -1938,8 +1961,10 @@ final class EditHistory {
         CropEdit(
             crop: currentCrop,
             encoding: encoding,
-            imageEncoding: currentImageEncoding, exportsFrame: currentExportsFrame, speeds: currentSpeeds)
+            imageEncoding: currentImageEncoding, exportsFrame: currentExportsFrame, speeds: currentSpeeds, outputWidth: currentOutputWidth)
     }
+    /// The exported size of a crop. Reads only the output width and pixel step, not the whole edit.
+    func outputSize(for crop: CGSize) -> CGSize { crop.scaled(toWidth: currentOutputWidth, step: pixelStep) }
     var exportsFrame: Bool { currentExportsFrame }
     var exportFormat: ExportFormat {
         get {
@@ -1982,7 +2007,7 @@ final class EditHistory {
     }
     /// The encoding part of the edit. Views read this instead of `value`, so they don't track the crop or speeds.
     var encoding: EncodingSettings {
-        EncodingSettings(codec: currentCodec, megabitsPerSecond: currentBitrate, container: currentContainer, outputWidth: currentOutputWidth)
+        EncodingSettings(codec: currentCodec, megabitsPerSecond: currentBitrate, container: currentContainer)
     }
     var crop: CropMargins {
         get { currentCrop }
@@ -2022,7 +2047,7 @@ final class EditHistory {
         get { currentOutputWidth }
         set {
             var edit = value
-            edit.encoding.outputWidth = newValue
+            edit.outputWidth = newValue
             set(edit)
         }
     }
@@ -2113,7 +2138,7 @@ final class EditHistory {
         currentCodec = edit.encoding.codec
         currentBitrate = edit.encoding.megabitsPerSecond
         currentContainer = edit.encoding.container
-        currentOutputWidth = edit.encoding.outputWidth
+        currentOutputWidth = edit.outputWidth
         currentImageEncoding = edit.imageEncoding
         currentExportsFrame = edit.exportsFrame
         currentSpeeds = edit.speeds
@@ -4729,11 +4754,15 @@ enum ImageError: LocalizedError {
 enum ImageExporter {
     private static let imageContext = CIContext(options: [.cacheIntermediates: false])
     
-    static func export(source: ImageSource, destination: URL, crop: CGRect, settings: ImageEncodingSettings) throws {
+    static func export(source: ImageSource, destination: URL, crop: CGRect, outputSize: CGSize, settings: ImageEncodingSettings) throws {
         try Task.checkCancellation()
         let bounds = CGRect(x: 0, y: 0, width: source.image.width, height: source.image.height)
-        guard crop.width >= 1, crop.height >= 1, crop == crop.integral,
-              crop.width <= CGFloat(CropMargins.maximumDimension), crop.height <= CGFloat(CropMargins.maximumDimension) else { throw ImageError.invalidCrop }
+        let maximum = CGFloat(CropMargins.maximumDimension)
+        guard crop.width >= 1, crop.height >= 1, crop == crop.integral, crop.width <= maximum, crop.height <= maximum,
+              outputSize.width >= 1, outputSize.height >= 1, outputSize.width <= maximum, outputSize.height <= maximum else { throw ImageError.invalidCrop }
+        /// Rendering keeps the original's depth and colors, with HDR in half floats.
+        let format: CIFormat = source.isHDR ? .RGBAh : (source.image.bitsPerComponent > 8 ? .RGBA16 : .RGBA8)
+        let colorSpace = source.image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
         let cropped: CGImage
         if bounds.contains(crop), let image = source.image.cropping(to: crop) {
             cropped = image
@@ -4743,9 +4772,30 @@ enum ImageExporter {
             let original = CIImage(cgImage: source.image).transformed(by: CGAffineTransform(translationX: -crop.minX, y: crop.maxY - bounds.height))
             let clear = CIImage(color: .clear).cropped(to: outputBounds)
             let padded = original.composited(over: clear).cropped(to: outputBounds)
-            let format: CIFormat = source.isHDR ? .RGBAh : (source.image.bitsPerComponent > 8 ? .RGBA16 : .RGBA8)
-            guard let image = imageContext.createCGImage(padded, from: outputBounds, format: format, colorSpace: source.image.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!) else { throw ImageError.encodingFailed }
+            guard let image = imageContext.createCGImage(padded, from: outputBounds, format: format, colorSpace: colorSpace) else { throw ImageError.encodingFailed }
             cropped = image
+        }
+        let sized: CGImage
+        if outputSize != crop.size {
+            /// Smooth bilinear resampling, like Figma's Basic. Sharpening filters such as Lanczos ring around alpha edges and shadows.
+            /// Halve first while shrinking past one half, so every source pixel is averaged.
+            /// The edges are extended so they don't fade.
+            let outputBounds = CGRect(origin: .zero, size: outputSize)
+            var resized = CIImage(cgImage: cropped).clampedToExtent().samplingLinear()
+            var scaleX = outputSize.width / crop.width
+            var scaleY = outputSize.height / crop.height
+            while scaleX < 0.5 || scaleY < 0.5 {
+                let halfX: CGFloat = scaleX < 0.5 ? 0.5 : 1
+                let halfY: CGFloat = scaleY < 0.5 ? 0.5 : 1
+                resized = resized.transformed(by: CGAffineTransform(scaleX: halfX, y: halfY))
+                scaleX /= halfX
+                scaleY /= halfY
+            }
+            resized = resized.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY)).cropped(to: outputBounds)
+            guard let image = imageContext.createCGImage(resized, from: outputBounds, format: format, colorSpace: colorSpace) else { throw ImageError.encodingFailed }
+            sized = image
+        } else {
+            sized = cropped
         }
         guard let destination = CGImageDestinationCreateWithURL(destination as CFURL, settings.format.contentType.identifier as CFString, 1, nil) else {
             throw ImageError.encodingFailed
@@ -4765,15 +4815,15 @@ enum ImageExporter {
             }
         }
         let output: CGImage
-        if source.isHDR && settings.format == .png && cropped.colorSpace.map({ CGColorSpaceUsesITUR_2100TF($0) }) != true {
+        if source.isHDR && settings.format == .png && sized.colorSpace.map({ CGColorSpaceUsesITUR_2100TF($0) }) != true {
             /// PNG needs a nonlinear HDR profile to store floating-point HDR pixels.
             let colorSpace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)!
             guard let rendered = imageContext.createCGImage(
-                CIImage(cgImage: cropped), from: CGRect(x: 0, y: 0, width: cropped.width, height: cropped.height),
+                CIImage(cgImage: sized), from: CGRect(x: 0, y: 0, width: sized.width, height: sized.height),
                 format: .RGBA16, colorSpace: colorSpace) else { throw ImageError.encodingFailed }
             output = rendered
         } else {
-            output = cropped
+            output = sized
         }
         CGImageDestinationAddImage(destination, output, properties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw ImageError.encodingFailed }
@@ -4785,6 +4835,8 @@ enum ImageExporter {
 struct ImageEncodingSection: View {
     @Bindable var history: EditHistory
     let hasTransparency: Bool
+    let cropSize: CGSize
+    let loaded: Bool
     
     var body: some View {
         CropInspectorSection("Encoding") {
@@ -4801,6 +4853,7 @@ struct ImageEncodingSection: View {
                 .labelsHidden()
                 .fixedSize()
             }
+            OutputSizeRow(history: history, cropSize: cropSize, loaded: loaded)
             ImageQualityControls(history: history, hasTransparency: hasTransparency)
         }
     }
@@ -4886,16 +4939,6 @@ struct EncodingSettings: Sendable, Equatable {
     var codec: Codec = .hevc
     var megabitsPerSecond = 2.5
     var container = VideoContainer.preferred
-    /// The exported width. Nil exports the crop at its own size.
-    var outputWidth: Int? = nil
-    
-    /// The exported size: the chosen width with the crop's proportions, in even pixels.
-    func outputSize(for crop: CGSize) -> CGSize {
-        guard let outputWidth, crop.width > 0, crop.height > 0 else { return crop }
-        let width = max(2, outputWidth / 2 * 2)
-        let height = max(2, Int((Double(width) * crop.height / crop.width / 2).rounded()) * 2)
-        return CGSize(width: width, height: height)
-    }
     
     /// The menu and slider use the same bitrate limits for the opened video.
     static func bitrateRange(for sourceMbps: Double) -> ClosedRange<Double> {
@@ -5057,7 +5100,7 @@ enum VideoExporter {
     
     /// Export the selected crop with the chosen codec and bitrate.
     static func export(
-        source: URL, destination: URL, crop: CGRect, settings: EncodingSettings, speedSections: [SpeedSection] = [], fill: ImageBackground = ImageBackground(), fileSize: @escaping @Sendable (Int64) -> Void = { _ in },
+        source: URL, destination: URL, crop: CGRect, outputSize: CGSize, settings: EncodingSettings, speedSections: [SpeedSection] = [], fill: ImageBackground = ImageBackground(), fileSize: @escaping @Sendable (Int64) -> Void = { _ in },
         progress: @escaping @Sendable (Double) -> Void = { _ in }
     ) async throws {
         let asset = AVURLAsset(url: source)
@@ -5068,9 +5111,9 @@ enum VideoExporter {
                 else {
             throw failure("Choose even output dimensions between 2 and 16384 pixels.")
         }
-        let outputSize = settings.outputSize(for: crop.size)
         guard outputSize.width >= 2, outputSize.height >= 2,
-              outputSize.width <= CGFloat(CropMargins.maximumDimension), outputSize.height <= CGFloat(CropMargins.maximumDimension)
+              outputSize.width <= CGFloat(CropMargins.maximumDimension), outputSize.height <= CGFloat(CropMargins.maximumDimension),
+              Int(outputSize.width).isMultiple(of: 2), Int(outputSize.height).isMultiple(of: 2)
         else {
             throw failure("Choose an output size between 2 and 16384 pixels.")
         }
