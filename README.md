@@ -23,6 +23,10 @@ Visit [**achrafkassioui.com/good-frame**](https://www.achrafkassioui.com/good-fr
 
 ## Change Log
 
+### 1.7.4
+
+- Fixed a faint line around the crop in Preview.
+
 ### 1.7.3
 
 - A resize cursor is now maintained until the drag ends.

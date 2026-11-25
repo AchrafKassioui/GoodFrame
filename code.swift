@@ -4269,7 +4269,6 @@ final class VideoCanvasView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        fillLayer.fillRule = .evenOdd
         layer?.addSublayer(fillLayer)
         videoSurface.wantsLayer = true
         videoLayer.videoGravity = .resize
@@ -4293,23 +4292,18 @@ final class VideoCanvasView: NSView {
     func positionVideo(in imageFrame: CGRect, retained: CGRect, scale: CGFloat) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        /// Show the export background inside the framing rectangle, but not under the media.
-        /// Both share the crop's edges, which fall between screen pixels, so a fill underneath would show through as a light outline.
-        /// On padded sides, the hole stops a point inside the media's edge, so no gap opens where they meet.
-        /// On other sides it reaches the crop's edge, so nothing is left under the media.
+        /// Show the export background only on padded sides, as strips along the crop's edges.
+        /// Each strip reaches a point under the media, so no gap opens where they meet.
+        /// An inset crop gets no strips, so nothing is drawn along its edges.
         let cropFrame = CGRect(x: imageFrame.minX + retained.minX * scale, y: imageFrame.minY + retained.minY * scale, width: retained.width * scale, height: retained.height * scale)
         fillLayer.frame = cropFrame
         let fillBounds = CGRect(origin: .zero, size: cropFrame.size)
         let media = imageFrame.offsetBy(dx: -cropFrame.minX, dy: -cropFrame.minY)
-        let left = media.minX > 0 ? media.minX + 1 : 0
-        let top = media.minY > 0 ? media.minY + 1 : 0
-        let right = media.maxX < fillBounds.maxX ? media.maxX - 1 : fillBounds.maxX
-        let bottom = media.maxY < fillBounds.maxY ? media.maxY - 1 : fillBounds.maxY
         let fillPath = CGMutablePath()
-        fillPath.addRect(fillBounds)
-        if right > left, bottom > top {
-            fillPath.addRect(CGRect(x: left, y: top, width: right - left, height: bottom - top))
-        }
+        if media.minX > 0 { fillPath.addRect(CGRect(x: 0, y: 0, width: media.minX + 1, height: fillBounds.height)) }
+        if media.minY > 0 { fillPath.addRect(CGRect(x: 0, y: 0, width: fillBounds.width, height: media.minY + 1)) }
+        if media.maxX < fillBounds.maxX { fillPath.addRect(CGRect(x: media.maxX - 1, y: 0, width: fillBounds.maxX - media.maxX + 1, height: fillBounds.height)) }
+        if media.maxY < fillBounds.maxY { fillPath.addRect(CGRect(x: 0, y: media.maxY - 1, width: fillBounds.width, height: fillBounds.maxY - media.maxY + 1)) }
         fillLayer.path = fillPath
         videoSurface.frame = imageFrame
         mediaLayer.frame = videoSurface.bounds
